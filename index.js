@@ -116,31 +116,57 @@ function saveLidCache() {
     fs.writeFileSync(LID_CACHE_FILE, JSON.stringify(lidCache, null, 2))
 }
 
-// Resolves a LID to a real phone number.
-// First checks the local cache; if not found, queries WhatsApp servers via
-// sock.onWhatsApp() which always returns the real PN for any valid account.
+// Resolves a LID (e.g. "77705185873989@lid") to a real phone number string.
+//
+// Resolution order — most reliable first:
+//   1. Local lidCache (persisted to lidcache.json across restarts)
+//   2. sock.signalRepository.lidMapping.getPNForLID() — reads from Baileys'
+//      internal store populated during initial sync (no network call, fast).
+//      This is the fix: the previous code only tried onWhatsApp() which
+//      explicitly does NOT support LIDs and always fails.
+//   3. sock.onWhatsApp() — kept as last resort; usually fails for LIDs but
+//      occasionally works on older Baileys builds.
+//
 // Returns the plain PN string (e.g. "237682477421") or '' if unresolvable.
 async function resolvelidToPN(sock, lid) {
     if (!lid || !lid.includes('@lid')) return ''
 
-    // Check cache first
+    // ── 1. Local cache ───────────────────────────────────────
     if (lidCache[lid]) {
         console.log(`[lid] Cache hit: ${lid} → ${lidCache[lid]}`)
         return lidCache[lid]
     }
 
-    // Query WhatsApp servers
+    // ── 2. Baileys internal signal repository (LOCAL — no network) ──
+    // getLIDForPN/getPNForLID read from lid-mapping-*.json written to
+    // auth_info/ during initial sync. This is the correct API per Baileys
+    // v7 migration docs. lid-mapping.update is never emitted in production
+    // (confirmed GitHub issue #2416) — query the store directly instead.
+    try {
+        const pnJid = await sock.signalRepository?.lidMapping?.getPNForLID(lid)
+        if (pnJid) {
+            const realPN = pnJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+            if (realPN && /^[0-9]{7,15}$/.test(realPN)) {
+                lidCache[lid] = realPN
+                saveLidCache()
+                console.log(`[lid] Resolved via signalRepository: ${lid} → ${realPN}`)
+                return realPN
+            }
+        }
+    } catch (err) {
+        console.log(`[lid] signalRepository lookup failed for ${lid}:`, err.message)
+    }
+
+    // ── 3. WhatsApp server query (last resort — usually fails for LIDs) ──
     try {
         const results = await sock.onWhatsApp(lid)
         if (results && results.length > 0) {
-            // onWhatsApp returns [{ jid, exists, ... }]
-            // The jid field is the real @s.whatsapp.net JID — strip domain to get PN
             const realJid = results[0].jid || ''
             const realPN  = realJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
-            if (realPN) {
+            if (realPN && /^[0-9]{7,15}$/.test(realPN)) {
                 lidCache[lid] = realPN
                 saveLidCache()
-                console.log(`[lid] Resolved: ${lid} → ${realPN}`)
+                console.log(`[lid] Resolved via onWhatsApp: ${lid} → ${realPN}`)
                 return realPN
             }
         }
@@ -263,6 +289,77 @@ async function startBot() {
 
         if (connection === 'open') {
             console.log('✅ WRG Bot is connected! 🎮')
+
+            // ── Seed LID↔PN mappings from every available source on boot ──────
+            // We do this BEFORE sending the boot DM so that by the time the creator
+            // reads their DM and replies, their LID is already in lidCache and
+            // getTier() will correctly return CREATOR for their messages.
+            //
+            // Source A: sock.signalRepository.lidMapping.getLIDForPN()
+            //   Queries the local store for the creator's PN → LID mapping.
+            //   This is populated during initial sync from the main device.
+            //
+            // Source B: auth_info/lid-mapping-*.json files
+            //   Baileys v7 writes all known LID↔PN pairs to these files.
+            //   Reading them directly is the most reliable approach (confirmed
+            //   GitHub issue #2416: lid-mapping.update event never fires).
+            ;(async () => {
+                const creatorJidEnv = process.env.CREATOR_JID || ''
+                const creatorNum    = creatorJidEnv.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+
+                // Source A — signal repository getLIDForPN
+                if (creatorNum && sock.signalRepository?.lidMapping?.getLIDForPN) {
+                    try {
+                        const creatorPnJid = `${creatorNum}@s.whatsapp.net`
+                        const creatorLid   = await sock.signalRepository.lidMapping.getLIDForPN(creatorPnJid)
+                        if (creatorLid) {
+                            const lidBase = creatorLid.split(':')[0]  // strip device suffix
+                            const fullLid = lidBase.includes('@') ? lidBase : `${lidBase}@lid`
+                            if (!lidCache[fullLid]) {
+                                lidCache[fullLid] = creatorNum
+                                saveLidCache()
+                                console.log(`[boot] Creator LID seeded from signalRepository: ${fullLid} → ${creatorNum}`)
+                            }
+                        }
+                    } catch (err) {
+                        console.log(`[boot] Could not seed creator LID from signalRepository:`, err.message)
+                    }
+                }
+
+                // Source B — read all auth_info/lid-mapping-*.json files
+                try {
+                    const authDir = 'auth_info'
+                    if (fs.existsSync(authDir)) {
+                        const lidFiles = fs.readdirSync(authDir).filter(f => f.startsWith('lid-mapping') && f.endsWith('.json'))
+                        let seeded = 0
+                        for (const fname of lidFiles) {
+                            try {
+                                const raw  = fs.readFileSync(`${authDir}/${fname}`, 'utf8')
+                                const data = JSON.parse(raw)
+                                // Baileys stores these as { lid: pnJid } or [{ lid, pn }] — handle both shapes
+                                const entries = Array.isArray(data) ? data : Object.entries(data).map(([lid, pn]) => ({ lid, pn }))
+                                for (const entry of entries) {
+                                    const lid = entry.lid || entry[0] || ''
+                                    const pn  = entry.pn  || entry[1] || ''
+                                    if (!lid || !pn) continue
+                                    const lidKey = lid.includes('@') ? lid.split(':')[0] + '@lid' : `${lid}@lid`
+                                    const pnNum  = pn.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+                                    if (pnNum && /^[0-9]{7,15}$/.test(pnNum) && !lidCache[lidKey]) {
+                                        lidCache[lidKey] = pnNum
+                                        seeded++
+                                    }
+                                }
+                            } catch (_) {}
+                        }
+                        if (seeded > 0) {
+                            saveLidCache()
+                            console.log(`[boot] Seeded ${seeded} LID→PN mapping(s) from auth_info files`)
+                        }
+                    }
+                } catch (err) {
+                    console.log(`[boot] Could not read auth_info LID mapping files:`, err.message)
+                }
+            })()
 
             // FIX BUG-09: boot DM to creator as well as admin
             if (!hasSentBootAdminConfirmation) {
@@ -394,7 +491,9 @@ async function startBot() {
             }
 
             if (!senderNumber && sender && sender.includes('@lid')) {
-                // LID — resolve to real PN via cache or WhatsApp server query
+                // LID — resolve to real PN. resolvelidToPN now tries the local
+                // signalRepository first, so this will succeed whenever Baileys
+                // has the mapping cached from the initial sync.
                 senderNumber = await resolvelidToPN(sock, sender)
                 if (!senderNumber) {
                     console.log(`[lid] Could not resolve LID: ${sender}`)
@@ -408,28 +507,14 @@ async function startBot() {
                 senderNumber = ''
             }
 
-            // If senderNumber is still empty after all PN resolution attempts,
-            // fall back to the LID's numeric part as a stable session identifier.
-            // A LID number is NOT a phone number but it IS unique and consistent —
-            // the same person will always have the same LID in a given group.
-            // This prevents the bot from silently ignoring every group member
-            // whose PN WhatsApp couldn't provide (the most common log error).
-            if (!senderNumber && sender && sender.includes('@lid')) {
-                const lidNum = sender.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
-                if (lidNum) {
-                    senderNumber = lidNum
-                    console.log(`[senderNumber] LID fallback identifier: ${lidNum} (real PN unavailable — using LID numeric part)`)
-                }
-            }
-
-            // Still nothing — only slash commands get through (senderJid is enough
-            // to reply to an onboarding request even without any identifier).
-            if (!senderNumber) {
-                const isSlashCommand = body.startsWith(settings.adminPrefix)
-                if (!isSlashCommand) {
-                    console.log(`[senderNumber] Could not resolve any identifier — skipping`)
-                    continue
-                }
+            // If senderNumber is still empty at this point:
+            // — Slash commands ALWAYS get through (e.g. /admin onboarding must work
+            //   even when PN resolution fails — senderJid is enough to reply to them)
+            // — Everything else is skipped to avoid processing unidentified messages
+            const isSlashCommand = body.startsWith(settings.adminPrefix)
+            if (!senderNumber && !isSlashCommand) {
+                console.log(`[senderNumber] Could not resolve PN and not a slash command — skipping`)
+                continue
             }
 
             // ── senderJid: the JID to DM this sender ─────────

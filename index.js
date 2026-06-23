@@ -373,7 +373,7 @@ async function startBot() {
                             text:
                                 `🔁 *WRG Bot is back online!* ✅\n\n` +
                                 `👑 You're the *Creator* (unrestricted access).\n\n` +
-                                `Type */help* to open your full dashboard.\n\n` +
+                                `Type */wrg help* to open your full dashboard.\n\n` +
                                 `_WRG Bot · by Sky Graphics_ 🎨`
                         })
                         console.log(`🔐 Sent boot DM to creator`)
@@ -391,7 +391,7 @@ async function startBot() {
                             text:
                                 `🔁 *WRG Bot is back online!* ✅\n\n` +
                                 `👑 You're registered as admin (${settings.adminNumber}).\n\n` +
-                                `Type */help* at any time to see all your commands.\n\n` +
+                                `Type */wrg help* at any time to see all your commands.\n\n` +
                                 `_WRG Bot · by Sky Graphics_ 🎨`
                         })
                         console.log(`👑 Sent boot DM to admin ${bootTarget}`)
@@ -399,7 +399,7 @@ async function startBot() {
                         console.log('⚠️ Could not DM admin on boot:', err.message)
                     }
                 } else if (!bootTarget && !creatorJid) {
-                    console.log('ℹ️ No admin set yet. Someone must type /admin to begin onboarding.')
+                    console.log('ℹ️ No admin set yet. Someone must type /wrg admin to begin onboarding.')
                 }
             }
 
@@ -419,7 +419,7 @@ async function startBot() {
                     await sendGameBoard(activeGameChatRef.value, '🔁 *Round recovered after a restart.*', [], ctx)
                 } else if (gs.active && gs.paused) {
                     await sock.sendMessage(activeGameChatRef.value, {
-                        text: `🔁 *Bot restarted.* The round is still paused — an admin must type */resume* to continue. ⏸️`
+                        text: `🔁 *Bot restarted.* The round is still paused — an admin must type */wrg resume* to continue. ⏸️`
                     })
                 }
             }
@@ -639,7 +639,7 @@ async function startBot() {
                                     text:
                                         `⚠️ *Duplicate Game Attempt*\n\n` +
                                         `Someone tried to start a game in *${from}* while a game is already active in *${activeGameChatRef.value}*.\n\n` +
-                                        `Use */end* to stop the current game if needed. 🎮`
+                                        `Use */wrg end* to stop the current game if needed. 🎮`
                                 })
                             } catch (_) {}
                         }

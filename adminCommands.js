@@ -191,7 +191,7 @@ async function handleAdminCommand(ctx) {
         pendingAdminChangeRef, saveSettings, saveWords, persistGames,
         sendSafeMessage, getGameState, startTurnCountdown,
         DEFAULT_WORDS, fs, nameCache,
-        senderNumber, senderDisplayId, senderJid, senderName, body, senderTier,
+        senderNumber, senderJid, senderName, body, senderTier,
         sender
     } = ctx
 
@@ -199,11 +199,6 @@ async function handleAdminCommand(ctx) {
     // goes to the requester's own DM, never contaminated by CREATOR_JID.
     // This is what ensures /admin responses land in the correct person's DM.
     const requesterJid = senderNumber ? `${senderNumber}@s.whatsapp.net` : senderJid
-
-    // displayId — best available identifier to show in creator notifications
-    // and use as the approvalQueue key. Real PN when available, LID numeric
-    // part as fallback so /approve always has something to show and match.
-    const displayId = senderDisplayId || senderNumber || senderJid.split('@')[0].split(':')[0] || 'unknown'
 
     const creatorJid    = process.env.CREATOR_JID || ''
     const creatorNumber = creatorJid.split('@')[0].split(':')[0]
@@ -336,14 +331,13 @@ async function handleAdminCommand(ctx) {
             const approvedSession = { ...session }
             delete pendingKeys[senderJid]
             delete approvalQueue[senderNumber]
-            delete approvalQueue[displayId]
 
             // Extract real PN from requesterJid — when admin types key in DM
             // remoteJid is always their real @s.whatsapp.net JID.
             const confirmedPN  = requesterJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
             const confirmedJid = requesterJid
 
-            settings.adminNumber = confirmedPN  || senderNumber || displayId
+            settings.adminNumber = confirmedPN || senderNumber
             settings.adminJid    = confirmedJid || senderJid
             saveSettings()
 
@@ -407,10 +401,9 @@ async function handleAdminCommand(ctx) {
             key: newKey,
             expiresAt: Date.now() + 10 * 60 * 1000,
             senderNumber,
-            displayId,
             senderName: reqName
         }
-        approvalQueue[displayId] = senderJid  // key is displayId so /approve works even when PN unavailable
+        approvalQueue[senderNumber] = senderJid
 
         await sendSafeMessage(sock, requesterJid, {
             text:
@@ -436,20 +429,20 @@ async function handleAdminCommand(ctx) {
                         `╚══════════════════════════╝\n\n` +
                         `Someone is requesting admin access to your bot.\n\n` +
                         `👤 *Name:* ${reqName}\n` +
-                        `📱 *ID:* \`${displayId}\`${!senderNumber ? ' ⚠️ _(LID — PN unavailable)_' : ''}\n` +
+                        `📱 *Number:* \`${senderNumber}\`\n` +
                         `🗝️ *Key:* \`${newKey}\`\n\n` +
                         `*What do you want to do?*\n\n` +
                         `✅ To *approve* and send them the key:\n` +
-                        `\`/wrg approve ${displayId}\`\n\n` +
+                        `\`/wrg approve ${senderNumber}\`\n\n` +
                         `❌ To *deny* and void the key immediately:\n` +
-                        `\`/wrg deny ${displayId}\`\n\n` +
+                        `\`/wrg deny ${senderNumber}\`\n\n` +
                         `_If you do nothing, the key auto-expires in 10 minutes._\n\n` +
                         `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
                         `_WRG Bot · Sky Graphics_ 🎨`
                 })
             } catch (err) {
                 console.log('⚠️ Could not DM creator with key request:', err.message)
-                console.log(`[FALLBACK] Admin key for ${displayId}: ${newKey}`)
+                console.log(`[FALLBACK] Admin key for ${senderNumber}: ${newKey}`)
             }
         } else {
             console.log(`[NO CREATOR_JID SET] Admin key for ${senderNumber}: ${newKey}`)
@@ -841,7 +834,7 @@ _Set by the admin._ 🛡️`
         if (['easy', 'normal', 'difficult'].includes(level)) {
             const list = words[level].join(', ')
             await sendSafeMessage(sock, replyTo, {
-                text: `📖 *${level.toUpperCase()} Pool:*\n\n${list || '[Empty — use /addword to add words]'}`
+                text: `📖 *${level.toUpperCase()} Pool:*\n\n${list || '[Empty — use /wrg addword to add words]'}`
             })
         } else {
             await sendSafeMessage(sock, replyTo, {

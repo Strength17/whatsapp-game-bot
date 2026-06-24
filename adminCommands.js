@@ -248,9 +248,19 @@ async function handleAdminCommand(ctx) {
             return
         }
 
-        // FIX BUG-16: confirmed admin → reply to senderJid not adminJid
+        // Confirmed admin types /wrg admin → identity confirmation only, not the dashboard
         if (isAdmin && settings.adminNumber !== '') {
-            await sendSafeMessage(sock, senderJid, { text: buildHelpText(settings, false) })
+            await sendSafeMessage(sock, senderJid, {
+                text:
+                    `╔══════════════════════════╗\n` +
+                    `   👑  WRG Administrator\n` +
+                    `╚══════════════════════════╝\n\n` +
+                    `Welcome back, *Administrator*. 👋\n\n` +
+                    `You have full control of the *WRG Bot* for your community.\n\n` +
+                    `Type */wrg help* to open your full dashboard.\n\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `_WRG Bot · Sky Graphics_ 🎨`
+            })
             return
         }
 
@@ -347,29 +357,14 @@ async function handleAdminCommand(ctx) {
 
             await sendSafeMessage(sock, confirmedJid, {
                 text:
-                    `╔══════════════════════════╗
-` +
-                    `   👑  Access Granted
-` +
-                    `╚══════════════════════════╝
-
-` +
-                    `*Welcome, Administrator!* 🎉
-
-` +
-                    `You now have full control of the *WRG Bot* for your community.
-
-` +
-                    `Your dashboard is below — everything you need is right here. ⬇️
-
-` +
-                    `━━━━━━━━━━━━━━━━━━━━━━━━━━
-` +
+                    `╔══════════════════════════╗\n` +
+                    `   👑  Access Granted\n` +
+                    `╚══════════════════════════╝\n\n` +
+                    `Welcome, *Administrator!* 🎉\n\n` +
+                    `You now have full control of the *WRG Bot* for your community.\n\n` +
+                    `Type */wrg help* to open your full dashboard.\n\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
                     `_WRG Bot · Sky Graphics_ 🎨`
-            })
-
-            await sendSafeMessage(sock, confirmedJid, {
-                text: buildHelpText(settings, false)
             })
 
             if (creatorJid) {

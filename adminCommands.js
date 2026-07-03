@@ -36,6 +36,16 @@ const pendingKeys = {}
 // Map: senderNumber → senderJid
 const approvalQueue = {}
 
+// ─── Voided sessions (3 failed key attempts) ──────────────────
+// Map: senderNumber → { voidedAt }
+// BUG FIX: a user who burns all 3 key attempts must not be able to
+// silently re-enter onboarding — with or without a key — until this
+// lockout window passes. Before this fix, bare "/wrg admin" fell straight
+// through to the "no input — generate key" branch and handed out a brand
+// new key as if the void never happened.
+const voidedSessions = {}
+const VOIDED_LOCKOUT_MS = 30 * 60 * 1000 // 30 minutes
+
 // ─── Rate limiting: /admin spam lockout ──────────────────────
 const adminRateLimit = {}
 
@@ -54,6 +64,13 @@ function cleanExpiredKeys() {
             const num = pendingKeys[jid].senderNumber
             delete pendingKeys[jid]
             delete approvalQueue[num]
+        }
+    }
+    // BUG FIX: expire voided lockouts too, or a voided user would be
+    // blocked forever with no way to request access again.
+    for (const num in voidedSessions) {
+        if (voidedSessions[num].voidedAt + VOIDED_LOCKOUT_MS < now) {
+            delete voidedSessions[num]
         }
     }
 }
@@ -123,62 +140,111 @@ function formatMaxTries(value) {
 }
 
 // ─── Help dashboard ───────────────────────────────────────────
-function buildHelpText(settings, forCreator = false) {
+function buildHelpText(settings, forCreator = false, section = null) {
     const tier = forCreator
         ? `👑 *CREATOR — Unrestricted Access*`
         : `🛡️ *Administrator*`
 
-    return (
+    const header =
         `╔══════════════════════════╗\n` +
         `   🎮  WRG Admin Dashboard\n` +
         `╚══════════════════════════╝\n` +
         `${tier}\n` +
-        `_Sky Graphics — Word Riddle Game_\n\n` +
-        `All commands work from *any chat*.\n` +
-        `Every reply comes to *your DM only*.\n\n` +
-        `Reply with *1*, *2*, or *3* for a category — or just use any command directly:\n\n` +
+        `_Sky Graphics — Word Riddle Game_\n\n`
 
-        `*1️⃣ Settings*\n` +
-        `› \`/wrg set difficulty [easy/normal/difficult]\`\n` +
-        `› \`/wrg set admin [number]\` → \`/wrg confirm\` · \`/wrg cancel\`\n` +
-        `› \`/wrg set public [on/off]\` — non-admin visibility\n` +
-        `› \`/wrg set start [on/off]\` — public lobby start\n` +
-        `› \`/wrg set autojoin [on/off]\` — auto-join lobbies when they open\n` +
-        `› \`/wrg set maxtries [n]\` — attempt budget\n` +
-        `› \`/wrg clearadmin\` — clear admin slot only (keeps pools)\n` +
-        `› \`/wrg reset\` — ⚠️ wipe ALL data\n\n` +
+    const footer =
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `_WRG Bot · Sky Graphics_ 🎨`
 
-        `*2️⃣ Word Pools*\n` +
-        `› \`/wrg addword [level] [word]\`\n` +
-        `› \`/wrg removeword [level] [word]\`\n` +
-        `› \`/wrg listwords [level]\`\n` +
-        `› \`/wrg setwords [level] w1 w2 ...\` — replace pool\n` +
-        `› \`/wrg clearwords [level]\` — cannot empty last pool\n` +
-        `› \`/wrg setallwords easy:w1,w2 normal:w3 difficult:w4\`\n\n` +
-
-        `*3️⃣ Game Controls*\n` +
-        `› \`/wrg status\` — live game state in your DM\n` +
-        `› \`/wrg start\` — force lobby to start immediately\n` +
-        `› \`/wrg pause\` — freeze turn timer\n` +
-        `› \`/wrg resume\` — unfreeze\n` +
-        `› \`/wrg end\` · \`/wrg stop\` — kill active game\n\n` +
-
-        (forCreator
-            ? `*🔐 Creator-Only:*\n` +
-              `› \`/wrg approve [number]\` — send access key to requester\n` +
-              `› \`/wrg deny [number]\` — void their key immediately\n\n`
-            : '') +
-
+    const liveConfig =
         `*📊 Live Config:*\n` +
         `› Difficulty: *${(resolveSetting('difficulty', settings, 'easy') || 'easy').toUpperCase()}*\n` +
         `› Max Tries: *${formatMaxTries(resolveSetting('maxTries', settings, 'auto'))}*\n` +
         `› Public Visible: *${resolveSetting('publicVisible', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
         `› Public Can Start: *${resolveSetting('publicCanStart', settings, false) ? '🟢 ON' : '🔴 OFF'}*\n` +
         `› Auto-Join Lobby: *${resolveSetting('autoJoin', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
-        `› Admin Set: *${settings.adminNumber ? '✅ ' + settings.adminNumber : '❌ None'}*\n\n` +
+        `› Admin Set: *${settings.adminNumber ? '✅ ' + settings.adminNumber : '❌ None'}*\n\n`
 
-        `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `_WRG Bot · Sky Graphics_ 🎨`
+    // ── No section chosen → collapsed menu ──────────────────────
+    if (section === null || section === undefined) {
+        return (
+            header +
+            `All commands work from *any chat*.\n` +
+            `Every reply comes to *your DM only*.\n\n` +
+            `Type */wrg help [number]* to expand a category:\n\n` +
+            `*1️⃣  Settings* — difficulty, visibility, admin slot, max tries\n` +
+            `*2️⃣  Word Pools* — add, remove, list, replace, clear words\n` +
+            `*3️⃣  Game Controls* — status, pause, resume, end, force start\n` +
+            (forCreator ? `*🔐  Creator-Only* — approve / deny access keys\n` : ``) +
+            `\n` +
+            liveConfig +
+            footer
+        )
+    }
+
+    // ── Section 1 — Settings ─────────────────────────────────────
+    if (section === 1) {
+        return (
+            header +
+            `*1️⃣  Settings Commands*\n\n` +
+            `› \`/wrg set difficulty [easy/normal/difficult]\`\n` +
+            `› \`/wrg set admin [number]\`\n` +
+            `  then → \`/wrg confirm\` or \`/wrg cancel\`\n` +
+            `› \`/wrg set public [on/off]\` — non-admin visibility\n` +
+            `› \`/wrg set start [on/off]\` — public lobby start\n` +
+            `› \`/wrg set autojoin [on/off]\` — auto-join lobbies\n` +
+            `› \`/wrg set maxtries [n / auto]\` — attempt budget\n` +
+            `› \`/wrg clearadmin\` — clear admin slot, keep pools\n` +
+            (forCreator ? `› \`/wrg reset\` — ⚠️ wipe ALL data\n` : ``) +
+            `\n` +
+            liveConfig +
+            footer
+        )
+    }
+
+    // ── Section 2 — Word Pools ───────────────────────────────────
+    if (section === 2) {
+        return (
+            header +
+            `*2️⃣  Word Pool Commands*\n\n` +
+            `› \`/wrg addword [level] [word]\`\n` +
+            `› \`/wrg removeword [level] [word]\`\n` +
+            `› \`/wrg listwords [level]\`\n` +
+            `› \`/wrg setwords [level] w1 w2 ...\` — replace pool\n` +
+            `› \`/wrg clearwords [level]\` — cannot empty last pool\n` +
+            `› \`/wrg setallwords easy:w1,w2 normal:w3 difficult:w4\`\n\n` +
+            footer
+        )
+    }
+
+    // ── Section 3 — Game Controls ────────────────────────────────
+    if (section === 3) {
+        return (
+            header +
+            `*3️⃣  Game Control Commands*\n\n` +
+            `› \`/wrg status\` — live game state in your DM\n` +
+            `› \`/wrg start\` — force lobby to start immediately\n` +
+            `› \`/wrg pause\` — freeze the turn timer\n` +
+            `› \`/wrg resume\` — unfreeze the turn timer\n` +
+            `› \`/wrg end\` · \`/wrg stop\` — terminate active game\n` +
+            (forCreator
+                ? `\n*🔐  Creator-Only:*\n` +
+                  `› \`/wrg approve [number]\` — send access key to requester\n` +
+                  `› \`/wrg deny [number]\` — void their key immediately\n`
+                : ``) +
+            `\n` +
+            footer
+        )
+    }
+
+    // ── Invalid number ───────────────────────────────────────────
+    return (
+        `⚠️ *Invalid option.*\n\n` +
+        `Use */wrg help [number]* to expand a section:\n\n` +
+        `*1️⃣  Settings*\n` +
+        `*2️⃣  Word Pools*\n` +
+        `*3️⃣  Game Controls*\n\n` +
+        `Example: \`/wrg help 2\``
     )
 }
 
@@ -273,6 +339,23 @@ async function handleAdminCommand(ctx) {
             return
         }
 
+        // ── Voided lockout check ────────────────────
+        // BUG FIX: this must run before the key-verification branch AND
+        // the "no input" branch below, so both "/wrg admin" and
+        // "/wrg admin SOMEKEY" hit it during the lockout window — not just
+        // one of the two forms.
+        const voided = voidedSessions[senderNumber]
+        if (voided && Date.now() - voided.voidedAt < VOIDED_LOCKOUT_MS) {
+            if (checkAdminRateLimit(senderNumber)) return
+            await sendSafeMessage(sock, requesterJid, {
+                text:
+                    `🚫 *Session Voided*\n\n` +
+                    `Too many incorrect attempts. Your access session has been cancelled.\n\n` +
+                    `Contact the *Sky Graphics* team to request a new key. 📩`
+            })
+            return
+        }
+
         // ── First-time onboarding ──────────────────
         const input = cmd.slice(1).join(' ').trim()
 
@@ -310,6 +393,10 @@ async function handleAdminCommand(ctx) {
                 if (session.attempts >= 3) {
                     delete pendingKeys[senderJid]
                     delete approvalQueue[senderNumber]
+                    // BUG FIX: record the void so subsequent /wrg admin
+                    // calls (with or without a key) stay locked out instead
+                    // of silently starting a fresh onboarding session.
+                    voidedSessions[senderNumber] = { voidedAt: Date.now() }
                     await sendSafeMessage(sock, requesterJid, {
                         text:
                             `🚫 *Session Voided*\n\n` +

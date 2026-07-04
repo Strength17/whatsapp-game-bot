@@ -649,12 +649,19 @@ async function handleAdminCommand(ctx) {
     //  /help — admin + creator only, DM only
     // ══════════════════════════════════════════════
     if (cmd[0] === 'help') {
+        // BUG FIX: the section number typed after "help" (e.g. the "1" in
+        // "/wrg help 1") was never being read or passed to buildHelpText,
+        // so every call fell through to the default collapsed menu —
+        // including invalid numbers, which should instead trigger the
+        // "Invalid option" message already built into buildHelpText.
+        const rawSection = cmd[1]
+        const section = rawSection === undefined ? null : parseInt(rawSection, 10)
         if (senderIsCreator) {
-            await sendSafeMessage(sock, senderJid, { text: buildHelpText(settings, true) })
+            await sendSafeMessage(sock, senderJid, { text: buildHelpText(settings, true, section) })
             return
         }
         if (isAdmin) {
-            await sendSafeMessage(sock, senderJid, { text: buildHelpText(settings, false) })
+            await sendSafeMessage(sock, senderJid, { text: buildHelpText(settings, false, section) })
             return
         }
         return

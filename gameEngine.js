@@ -114,7 +114,7 @@ function startLobbyCountdown(chatId, ctx) {
             await sock.sendMessage(chatId, {
                 text:
                     `⏱️ *WRG Lobby — Hurry Up!*\n` +
-                    `*${gameState.lobbySecondsLeft} seconds* left to join! Type *wrg join* now.\n` +
+                    `*${gameState.lobbySecondsLeft} seconds* left to join! Type *!wrg join* now.\n` +
                     `🎯 Mode: ${difficultyBadge(difficulty)}\n\n` +
                     `👥 *Current Lobby:*\n${lobbyText || '[No players yet — be first! 🎯]'}`,
                 mentions: lobbyMentions
@@ -136,7 +136,7 @@ async function startActualGame(chatId, ctx) {
         activeGameChatRef.value = null
         persistGames()
         return await sock.sendMessage(chatId, {
-            text: `🚫 *Game Cancelled*\nNo one joined the lobby in time. Type *WRG* to start a fresh lobby! 🎮`
+            text: `🚫 *Game Cancelled*\nNo one joined the lobby in time. Type *!WRG* to start a fresh lobby! 🎮`
         })
     }
 

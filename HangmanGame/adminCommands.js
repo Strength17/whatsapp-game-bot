@@ -1,55 +1,34 @@
 // ============================================================
-//  adminCommands.js — WRG Bot · Sky Graphics
-//  Handles ALL "/" commands with full security hardening.
+//  HangmanGame/adminCommands.js — HMG Bot · Sky Graphics
+//  Handles ALL "/hmg" commands with full security hardening.
 //
 //  Access tiers:
 //    CREATOR  — CREATOR_JID in .env. Unrestricted. Always works.
 //    ADMIN    — set via key onboarding. Full command access.
 //    EVERYONE ELSE — total silence on all "/" commands.
 //
-//  /admin  — onboarding gate (key request → creator approves → key sent)
-//  /help   — admin/creator dashboard, DM only, silent to all others
-//  /approve [number] — creator only: sends approved key to requester
-//  /deny   [number] — creator only: immediately voids the key
+//  /hmg admin  — onboarding gate (key request → creator approves → key sent)
+//  /hmg help   — admin/creator dashboard, DM only, silent to all others
+//  /hmg approve [number] — creator only: sends approved key to requester
+//  /hmg deny   [number] — creator only: immediately voids the key
+//  Game switching (/game setgame, /game setadminaccess) is NOT handled
+//  in this file — it's a fixed, game-independent prefix in index.js.
 // ============================================================
 
 const crypto = require('crypto')
 
-// FIX BUG-10: single clean import — no duplicate require
-const {
-    TIERS,
-    difficultyBadge, writeSetting,
-    resolveSetting, nameTag
-} = require('./permissions')
-
-// startActualGame is needed by the /wrg start (force-start) handler further
-// below. It was missing from this file's imports entirely — calling it
-// crashed with "ReferenceError: startActualGame is not defined" the first
-// time anyone ran /wrg start against an open lobby.
+const { TIERS, writeSetting, resolveSetting, nameTag } = require('../permissions')
 const { startActualGame } = require('./gameEngine')
+const config = require('./config')
 
 // ─── Pending key sessions ────────────────────────────────────
-// Map: senderJid → { key, expiresAt, senderNumber, senderName, attempts }
 const pendingKeys = {}
-
-// ─── Pending approval queue ──────────────────────────────────
-// Map: senderNumber → senderJid
 const approvalQueue = {}
-
-// ─── Voided sessions (3 failed key attempts) ──────────────────
-// Map: senderNumber → { voidedAt }
-// BUG FIX: a user who burns all 3 key attempts must not be able to
-// silently re-enter onboarding — with or without a key — until this
-// lockout window passes. Before this fix, bare "/wrg admin" fell straight
-// through to the "no input — generate key" branch and handed out a brand
-// new key as if the void never happened.
 const voidedSessions = {}
-const VOIDED_LOCKOUT_MS = 30 * 60 * 1000 // 30 minutes
+const VOIDED_LOCKOUT_MS = 30 * 60 * 1000
 
-// ─── Rate limiting: /admin spam lockout ──────────────────────
 const adminRateLimit = {}
 
-// ─── Admin inactivity tracker ────────────────────────────────
 let adminLastActive = 0
 let adminInactivityTimer = null
 
@@ -66,8 +45,6 @@ function cleanExpiredKeys() {
             delete approvalQueue[num]
         }
     }
-    // BUG FIX: expire voided lockouts too, or a voided user would be
-    // blocked forever with no way to request access again.
     for (const num in voidedSessions) {
         if (voidedSessions[num].voidedAt + VOIDED_LOCKOUT_MS < now) {
             delete voidedSessions[num]
@@ -80,12 +57,10 @@ function checkAdminRateLimit(senderNumber) {
     const entry = adminRateLimit[senderNumber] || { count: 0, lockedUntil: 0 }
 
     if (now < entry.lockedUntil) return true
-
     if (entry.lockedUntil && now >= entry.lockedUntil) {
         entry.count = 0
         entry.lockedUntil = 0
     }
-
     entry.count++
     if (entry.count >= 5) {
         entry.lockedUntil = now + 10 * 60 * 1000
@@ -115,7 +90,6 @@ function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage
             settings.adminJid    = ''
             saveSettings()
 
-            // FIX BUG-15: use full CREATOR_JID (valid JID) not bare creatorNumber digits
             const creatorJid = process.env.CREATOR_JID || ''
             if (creatorJid) {
                 try {
@@ -123,7 +97,7 @@ function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage
                         text:
                             `⚠️ *Admin Slot Auto-Cleared*\n\n` +
                             `${cleared} has been inactive for *30 days* — the admin slot has been reset.\n\n` +
-                            `The bot is now unconfigured. The next */wrg admin* request will begin fresh onboarding. 🚀`
+                            `The bot is now unconfigured. The next */hmg admin* request will begin fresh onboarding. 🚀`
                     })
                 } catch (_) {}
             }
@@ -132,8 +106,6 @@ function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage
     }, 60 * 60 * 1000)
 }
 
-// Formats the maxTries setting for display: 'auto' stays as a readable
-// label, a number shows as-is.
 function formatMaxTries(value) {
     if (value === 'auto' || value === undefined || value === null) return 'AUTO 🤖'
     return String(value)
@@ -147,104 +119,101 @@ function buildHelpText(settings, forCreator = false, section = null) {
 
     const header =
         `╔══════════════════════════╗\n` +
-        `   🎮  WRG Admin Dashboard\n` +
+        `   🎮  ${config.GAME_ACRONYM} Admin Dashboard\n` +
         `╚══════════════════════════╝\n` +
         `${tier}\n` +
-        `_Sky Graphics — Word Riddle Game_\n\n`
+        `_Sky Graphics — ${config.GAME_NAME}_\n\n`
 
     const footer =
         `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `_WRG Bot · Sky Graphics_ 🎨`
+        `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
 
     const liveConfig =
         `*📊 Live Config:*\n` +
-        `› Difficulty: *${(resolveSetting('difficulty', settings, 'easy') || 'easy').toUpperCase()}*\n` +
+        `› Word Length: *adaptive (currently drifting per chat)*\n` +
         `› Max Tries: *${formatMaxTries(resolveSetting('maxTries', settings, 'auto'))}*\n` +
         `› Public Visible: *${resolveSetting('publicVisible', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
         `› Public Can Start: *${resolveSetting('publicCanStart', settings, false) ? '🟢 ON' : '🔴 OFF'}*\n` +
         `› Auto-Join Lobby: *${resolveSetting('autoJoin', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
         `› Admin Set: *${settings.adminNumber ? '✅ ' + settings.adminNumber : '❌ None'}*\n\n`
 
-    // ── No section chosen → collapsed menu ──────────────────────
     if (section === null || section === undefined) {
         return (
             header +
             `All commands work from *any chat*.\n` +
             `Every reply comes to *your DM only*.\n\n` +
-            `Type */wrg help [number]* to expand a category:\n\n` +
-            `*1️⃣  Settings* — difficulty, visibility, admin slot, max tries\n` +
-            `*2️⃣  Word Pools* — add, remove, list, replace, clear words\n` +
+            `Type */hmg help [number]* to expand a category:\n\n` +
+            `*1️⃣  Settings* — visibility, admin slot, max tries\n` +
+            `*2️⃣  Word Pool* — add, remove, list, replace, clear words\n` +
             `*3️⃣  Game Controls* — status, pause, resume, end, force start\n` +
-            (forCreator ? `*🔐  Creator-Only* — approve / deny access keys\n` : ``) +
+            (forCreator ? `*🔐  Creator-Only* — approve/deny access keys, switch games\n` : ``) +
             `\n` +
             liveConfig +
             footer
         )
     }
 
-    // ── Section 1 — Settings ─────────────────────────────────────
     if (section === 1) {
         return (
             header +
             `*1️⃣  Settings Commands*\n\n` +
-            `› \`/wrg set difficulty [easy/normal/difficult]\`\n` +
-            `› \`/wrg set admin [number]\`\n` +
-            `  then → \`/wrg confirm\` or \`/wrg cancel\`\n` +
-            `› \`/wrg set public [on/off]\` — non-admin visibility\n` +
-            `› \`/wrg set start [on/off]\` — public lobby start\n` +
-            `› \`/wrg set autojoin [on/off]\` — auto-join lobbies\n` +
-            `› \`/wrg set maxtries [n / auto]\` — attempt budget\n` +
-            `› \`/wrg clearadmin\` — clear admin slot, keep pools\n` +
-            (forCreator ? `› \`/wrg reset\` — ⚠️ wipe ALL data\n` : ``) +
+            `› \`/hmg set admin [number]\`\n` +
+            `  then → \`/hmg confirm\` or \`/hmg cancel\`\n` +
+            `› \`/hmg set public [on/off]\` — non-admin visibility\n` +
+            `› \`/hmg set start [on/off]\` — public lobby start\n` +
+            `› \`/hmg set autojoin [on/off]\` — auto-join lobbies\n` +
+            `› \`/hmg set maxtries [n / auto]\` — attempt budget\n` +
+            `› \`/hmg clearadmin\` — clear admin slot, keep pools\n` +
+            (forCreator ? `› \`/hmg reset\` — ⚠️ wipe ALL data\n` : ``) +
             `\n` +
+            `_Note: there's no manual difficulty setting anymore — word length adapts automatically based on how the group performs each round._\n\n` +
             liveConfig +
             footer
         )
     }
 
-    // ── Section 2 — Word Pools ───────────────────────────────────
     if (section === 2) {
         return (
             header +
             `*2️⃣  Word Pool Commands*\n\n` +
-            `› \`/wrg addword [level] [word]\`\n` +
-            `› \`/wrg removeword [level] [word]\`\n` +
-            `› \`/wrg listwords [level]\`\n` +
-            `› \`/wrg setwords [level] w1 w2 ...\` — replace pool\n` +
-            `› \`/wrg clearwords [level]\` — cannot empty last pool\n` +
-            `› \`/wrg setallwords easy:w1,w2 normal:w3 difficult:w4\`\n\n` +
+            `› \`/hmg addword [word]\`\n` +
+            `› \`/hmg removeword [word]\`\n` +
+            `› \`/hmg listwords\`\n` +
+            `› \`/hmg setwords w1 w2 ...\` — replace the whole pool\n` +
+            `› \`/hmg clearwords\` — cannot empty the pool entirely\n\n` +
+            `_One flat pool now, spanning ${config.MIN_WORD_LENGTH}–${config.MAX_WORD_LENGTH} letters — the game itself picks the right length each round._\n\n` +
             footer
         )
     }
 
-    // ── Section 3 — Game Controls ────────────────────────────────
     if (section === 3) {
         return (
             header +
             `*3️⃣  Game Control Commands*\n\n` +
-            `› \`/wrg status\` — live game state in your DM\n` +
-            `› \`/wrg start\` — force lobby to start immediately\n` +
-            `› \`/wrg pause\` — freeze the turn timer\n` +
-            `› \`/wrg resume\` — unfreeze the turn timer\n` +
-            `› \`/wrg end\` · \`/wrg stop\` — terminate active game\n` +
+            `› \`/hmg status\` — live game state in your DM\n` +
+            `› \`/hmg start\` — force lobby to start immediately\n` +
+            `› \`/hmg pause\` — freeze the turn timer\n` +
+            `› \`/hmg resume\` — unfreeze the turn timer\n` +
+            `› \`/hmg end\` · \`/hmg stop\` — terminate active game\n` +
             (forCreator
                 ? `\n*🔐  Creator-Only:*\n` +
-                  `› \`/wrg approve [number]\` — send access key to requester\n` +
-                  `› \`/wrg deny [number]\` — void their key immediately\n`
+                  `› \`/hmg approve [number]\` — send access key to requester\n` +
+                  `› \`/hmg deny [number]\` — void their key immediately\n` +
+                  `› \`/game setgame [key]\` — switch the active game (fixed prefix, works from any game)\n` +
+                  `› \`/game setadminaccess [key|all]\` — scope the admin to one game\n`
                 : ``) +
             `\n` +
             footer
         )
     }
 
-    // ── Invalid number ───────────────────────────────────────────
     return (
         `⚠️ *Invalid option.*\n\n` +
-        `Use */wrg help [number]* to expand a section:\n\n` +
+        `Use */hmg help [number]* to expand a section:\n\n` +
         `*1️⃣  Settings*\n` +
-        `*2️⃣  Word Pools*\n` +
+        `*2️⃣  Word Pool*\n` +
         `*3️⃣  Game Controls*\n\n` +
-        `Example: \`/wrg help 2\``
+        `Example: \`/hmg help 2\``
     )
 }
 
@@ -256,35 +225,25 @@ async function handleAdminCommand(ctx) {
         sock, settings, words, games, activeGameChatRef,
         pendingAdminChangeRef, saveSettings, saveWords, persistGames,
         sendSafeMessage, getGameState, startTurnCountdown,
-        DEFAULT_WORDS, fs, nameCache,
+        fs, nameCache,
         senderNumber, senderJid, senderName, body, senderTier,
         sender
     } = ctx
 
-    // requesterJid — always built from the plain phone number so the message
-    // goes to the requester's own DM, never contaminated by CREATOR_JID.
-    // This is what ensures /admin responses land in the correct person's DM.
     const requesterJid = senderNumber ? `${senderNumber}@s.whatsapp.net` : senderJid
 
     const creatorJid    = process.env.CREATOR_JID || ''
     const creatorNumber = creatorJid.split('@')[0].split(':')[0]
 
-    // FIX BUG-11: derive tier from ctx.senderTier (computed in index.js)
-    // and expose isAdmin / senderIsCreator from it
     const senderIsCreator = senderTier === TIERS.CREATOR
-    const isAdmin         = senderTier === TIERS.CREATOR || senderTier === TIERS.ADMIN
+    const isAdmin          = senderTier === TIERS.CREATOR || senderTier === TIERS.ADMIN
+    const tier              = senderTier || TIERS.PUBLIC
 
-    // FIX BUG-11: tier is now always defined
-    const tier = senderTier || TIERS.PUBLIC
-
-    // Strip "/" and shift past "wrg" so cmd[0] = command, cmd[1]+ = args
-    // e.g. "/wrg help" -> raw="wrg help" -> parts=["wrg","help"] -> cmd=["help"]
-    // e.g. "/wrg set difficulty easy" -> cmd=["set","difficulty","easy"]
+    // Strip "/" and shift past "hmg" so cmd[0] = command, cmd[1]+ = args
     const raw   = body.slice(1).trim()
     const parts = raw.split(' ')
-    const cmd   = parts.slice(1)  // cmd[0]=command, cmd[1]+=arguments
+    const cmd   = parts.slice(1)
 
-    // Bump inactivity clock on every admin/creator command
     if (senderIsCreator || isAdmin) {
         adminLastActive = Date.now()
         if (settings.adminNumber && !adminInactivityTimer) {
@@ -292,12 +251,16 @@ async function handleAdminCommand(ctx) {
         }
     }
 
+    // Note: switching games / scoping admin access is NOT handled here.
+    // It lives entirely under the fixed "/game" prefix in index.js, so
+    // it works no matter which game is currently active — see
+    // game-switch-commands.js.
+
     // ══════════════════════════════════════════════
-    //  /admin
+    //  /hmg admin
     // ══════════════════════════════════════════════
     if (cmd[0] === 'admin') {
 
-        // Creator gets special identity message — reply always to senderJid
         if (senderIsCreator) {
             await sendSafeMessage(sock, senderJid, {
                 text:
@@ -307,30 +270,28 @@ async function handleAdminCommand(ctx) {
                     `Welcome back, *Founder*. 👋\n\n` +
                     `You have *unrestricted access* to every function of this bot — ` +
                     `no keys, no approvals, no gates.\n\n` +
-                    `Type */wrg help* to open the full dashboard.\n\n` +
+                    `Type */hmg help* to open the full dashboard.\n\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-                    `_WRG Bot · Sky Graphics_ 🎨`
+                    `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
             })
             return
         }
 
-        // Confirmed admin types /wrg admin → identity confirmation only, not the dashboard
         if (isAdmin && settings.adminNumber !== '') {
             await sendSafeMessage(sock, senderJid, {
                 text:
                     `╔══════════════════════════╗\n` +
-                    `   👑  WRG Administrator\n` +
+                    `   👑  ${config.GAME_ACRONYM} Administrator\n` +
                     `╚══════════════════════════╝\n\n` +
                     `Welcome back, *Administrator*. 👋\n\n` +
-                    `You have full control of the *WRG Bot* for your community.\n\n` +
-                    `Type */wrg help* to open your full dashboard.\n\n` +
+                    `You have full control of the *${config.GAME_ACRONYM} Bot* for your community.\n\n` +
+                    `Type */hmg help* to open your full dashboard.\n\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-                    `_WRG Bot · Sky Graphics_ 🎨`
+                    `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
             })
             return
         }
 
-        // Admin already set → subtle generic reply for non-admins
         if (settings.adminNumber !== '' && !isAdmin) {
             if (checkAdminRateLimit(senderNumber)) return
             await sendSafeMessage(sock, requesterJid, {
@@ -339,11 +300,6 @@ async function handleAdminCommand(ctx) {
             return
         }
 
-        // ── Voided lockout check ────────────────────
-        // BUG FIX: this must run before the key-verification branch AND
-        // the "no input" branch below, so both "/wrg admin" and
-        // "/wrg admin SOMEKEY" hit it during the lockout window — not just
-        // one of the two forms.
         const voided = voidedSessions[senderNumber]
         if (voided && Date.now() - voided.voidedAt < VOIDED_LOCKOUT_MS) {
             if (checkAdminRateLimit(senderNumber)) return
@@ -356,7 +312,6 @@ async function handleAdminCommand(ctx) {
             return
         }
 
-        // ── First-time onboarding ──────────────────
         const input = cmd.slice(1).join(' ').trim()
 
         if (input) {
@@ -393,9 +348,6 @@ async function handleAdminCommand(ctx) {
                 if (session.attempts >= 3) {
                     delete pendingKeys[senderJid]
                     delete approvalQueue[senderNumber]
-                    // BUG FIX: record the void so subsequent /wrg admin
-                    // calls (with or without a key) stay locked out instead
-                    // of silently starting a fresh onboarding session.
                     voidedSessions[senderNumber] = { voidedAt: Date.now() }
                     await sendSafeMessage(sock, requesterJid, {
                         text:
@@ -403,7 +355,6 @@ async function handleAdminCommand(ctx) {
                             `Too many incorrect attempts. Your access session has been cancelled.\n\n` +
                             `Contact the *Sky Graphics* team to request a new key. 📩`
                     })
-                    // FIX BUG-15: use creatorJid not creatorNumber
                     if (creatorJid) {
                         try {
                             await sendSafeMessage(sock, creatorJid, {
@@ -418,19 +369,16 @@ async function handleAdminCommand(ctx) {
                         text:
                             `❌ *Invalid Key*\n\n` +
                             `The key you entered is incorrect. (Attempt ${session.attempts}/3)\n\n` +
-                            `Double-check the key and try again: \`/wrg admin YOURKEY\` 🔑`
+                            `Double-check the key and try again: \`/hmg admin YOURKEY\` 🔑`
                     })
                 }
                 return
             }
 
-            // ✅ Correct key — register as admin
             const approvedSession = { ...session }
             delete pendingKeys[senderJid]
             delete approvalQueue[senderNumber]
 
-            // Extract real PN from requesterJid — when admin types key in DM
-            // remoteJid is always their real @s.whatsapp.net JID.
             const confirmedPN  = requesterJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
             const confirmedJid = requesterJid
 
@@ -448,24 +396,19 @@ async function handleAdminCommand(ctx) {
                     `   👑  Access Granted\n` +
                     `╚══════════════════════════╝\n\n` +
                     `Welcome, *Administrator!* 🎉\n\n` +
-                    `You now have full control of the *WRG Bot* for your community.\n\n` +
-                    `Type */wrg help* to open your full dashboard.\n\n` +
+                    `You now have full control of the *${config.GAME_ACRONYM} Bot* for your community.\n\n` +
+                    `Type */hmg help* to open your full dashboard.\n\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-                    `_WRG Bot · Sky Graphics_ 🎨`
+                    `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
             })
 
             if (creatorJid) {
                 try {
                     await sendSafeMessage(sock, creatorJid, {
                         text:
-                            `✅ *Admin Registration Complete*
-
-` +
-                            `👤 Name: *${approvedSession.senderName || 'Unknown'}*
-` +
-                            `📱 Number: \`${settings.adminNumber}\`
-
-` +
+                            `✅ *Admin Registration Complete*\n\n` +
+                            `👤 Name: *${approvedSession.senderName || 'Unknown'}*\n` +
+                            `📱 Number: \`${settings.adminNumber}\`\n\n` +
                             `_Bot is now live under new admin._ 🚀`
                     })
                 } catch (_) {}
@@ -473,11 +416,10 @@ async function handleAdminCommand(ctx) {
             return
         }
 
-        // No input — generate key, queue for creator approval
         if (checkAdminRateLimit(senderNumber)) return
 
-        const newKey     = generateKey()
-        const reqName    = senderName || senderNumber
+        const newKey  = generateKey()
+        const reqName = senderName || senderNumber
 
         pendingKeys[senderJid] = {
             key: newKey,
@@ -492,16 +434,15 @@ async function handleAdminCommand(ctx) {
                 `╔══════════════════════════╗\n` +
                 `   🔐  Admin Configuration\n` +
                 `╚══════════════════════════╝\n` +
-                `_WRG Bot · by Sky Graphics_ 🎨\n\n` +
+                `_${config.GAME_ACRONYM} Bot · by Sky Graphics_ 🎨\n\n` +
                 `Hello! 👋\n\n` +
                 `You're attempting to access the *Bot Administration Panel*.\n\n` +
                 `To proceed, enter the access key provided to you by the *Sky Graphics team*:\n\n` +
-                `\`/wrg admin YOURKEY\`\n\n` +
+                `\`/hmg admin YOURKEY\`\n\n` +
                 `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
                 `📩 Don't have a key? Contact Sky Graphics to request access.`
         })
 
-        // FIX BUG-15: alert creator via creatorJid
         if (creatorJid) {
             try {
                 await sendSafeMessage(sock, creatorJid, {
@@ -515,12 +456,12 @@ async function handleAdminCommand(ctx) {
                         `🗝️ *Key:* \`${newKey}\`\n\n` +
                         `*What do you want to do?*\n\n` +
                         `✅ To *approve* and send them the key:\n` +
-                        `\`/wrg approve ${senderNumber}\`\n\n` +
+                        `\`/hmg approve ${senderNumber}\`\n\n` +
                         `❌ To *deny* and void the key immediately:\n` +
-                        `\`/wrg deny ${senderNumber}\`\n\n` +
+                        `\`/hmg deny ${senderNumber}\`\n\n` +
                         `_If you do nothing, the key auto-expires in 10 minutes._\n\n` +
                         `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-                        `_WRG Bot · Sky Graphics_ 🎨`
+                        `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
                 })
             } catch (err) {
                 console.log('⚠️ Could not DM creator with key request:', err.message)
@@ -533,26 +474,21 @@ async function handleAdminCommand(ctx) {
     }
 
     // ══════════════════════════════════════════════
-    //  /approve [number] — CREATOR ONLY
+    //  /hmg approve [number] — CREATOR ONLY
     // ══════════════════════════════════════════════
     if (cmd[0] === 'approve') {
         if (!senderIsCreator) return
 
         const targetNumber = (cmd[1] || '').replace(/[^0-9]/g, '')
         if (!targetNumber) {
-            // FIX BUG-15: reply to creatorJid not creatorNumber
-            await sendSafeMessage(sock, creatorJid, {
-                text: `⚠️ Usage: \`/wrg approve [number]\``
-            })
+            await sendSafeMessage(sock, creatorJid, { text: `⚠️ Usage: \`/hmg approve [number]\`` })
             return
         }
 
         const targetJid = approvalQueue[targetNumber]
         if (!targetJid || !pendingKeys[targetJid]) {
             await sendSafeMessage(sock, creatorJid, {
-                text:
-                    `⚠️ *No active request found for* \`${targetNumber}\`\n\n` +
-                    `The session may have already expired or been denied.`
+                text: `⚠️ *No active request found for* \`${targetNumber}\`\n\nThe session may have already expired or been denied.`
             })
             return
         }
@@ -579,17 +515,15 @@ async function handleAdminCommand(ctx) {
                     `Here is your access key:\n\n` +
                     `*\`${session.key}\`*\n\n` +
                     `To activate your admin account, type:\n` +
-                    `\`/wrg admin ${session.key}\`\n\n` +
+                    `\`/hmg admin ${session.key}\`\n\n` +
                     `⏰ *This key expires in 10 minutes.*\n` +
                     `Do not share it with anyone.\n\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-                    `_WRG Bot · Sky Graphics_ 🎨`
+                    `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
             })
 
             await sendSafeMessage(sock, creatorJid, {
-                text:
-                    `✅ *Key delivered to* \`${targetNumber}\`\n\n` +
-                    `They now have until the 10-minute window closes to activate. ⏱️`
+                text: `✅ *Key delivered to* \`${targetNumber}\`\n\nThey now have until the 10-minute window closes to activate. ⏱️`
             })
         } catch (err) {
             await sendSafeMessage(sock, creatorJid, {
@@ -600,25 +534,21 @@ async function handleAdminCommand(ctx) {
     }
 
     // ══════════════════════════════════════════════
-    //  /deny [number] — CREATOR ONLY
+    //  /hmg deny [number] — CREATOR ONLY
     // ══════════════════════════════════════════════
     if (cmd[0] === 'deny') {
         if (!senderIsCreator) return
 
         const targetNumber = (cmd[1] || '').replace(/[^0-9]/g, '')
         if (!targetNumber) {
-            await sendSafeMessage(sock, creatorJid, {
-                text: `⚠️ Usage: \`/wrg deny [number]\``
-            })
+            await sendSafeMessage(sock, creatorJid, { text: `⚠️ Usage: \`/hmg deny [number]\`` })
             return
         }
 
         const targetJid = approvalQueue[targetNumber]
         if (!targetJid || !pendingKeys[targetJid]) {
             await sendSafeMessage(sock, creatorJid, {
-                text:
-                    `⚠️ *No active request found for* \`${targetNumber}\`\n\n` +
-                    `Already expired, approved, or never requested.`
+                text: `⚠️ *No active request found for* \`${targetNumber}\`\n\nAlready expired, approved, or never requested.`
             })
             return
         }
@@ -630,7 +560,7 @@ async function handleAdminCommand(ctx) {
             await sendSafeMessage(sock, targetJid, {
                 text:
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-                    `_Sky Graphics · WRG Bot_ 🎨\n` +
+                    `_Sky Graphics · ${config.GAME_ACRONYM} Bot_ 🎨\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
                     `Your access request could not be processed at this time.\n\n` +
                     `For further assistance, contact the *Sky Graphics* team directly. 📩`
@@ -638,22 +568,15 @@ async function handleAdminCommand(ctx) {
         } catch (_) {}
 
         await sendSafeMessage(sock, creatorJid, {
-            text:
-                `🚫 *Request denied and key voided.*\n\n` +
-                `\`${targetNumber}\` has been notified without details. 🔒`
+            text: `🚫 *Request denied and key voided.*\n\n\`${targetNumber}\` has been notified without details. 🔒`
         })
         return
     }
 
     // ══════════════════════════════════════════════
-    //  /help — admin + creator only, DM only
+    //  /hmg help — admin + creator only, DM only
     // ══════════════════════════════════════════════
     if (cmd[0] === 'help') {
-        // BUG FIX: the section number typed after "help" (e.g. the "1" in
-        // "/wrg help 1") was never being read or passed to buildHelpText,
-        // so every call fell through to the default collapsed menu —
-        // including invalid numbers, which should instead trigger the
-        // "Invalid option" message already built into buildHelpText.
         const rawSection = cmd[1]
         const section = rawSection === undefined ? null : parseInt(rawSection, 10)
         if (senderIsCreator) {
@@ -668,45 +591,21 @@ async function handleAdminCommand(ctx) {
     }
 
     // ══════════════════════════════════════════════
-    //  All commands below: creator OR confirmed admin only
+    //  Everything below: creator OR confirmed admin only
     // ══════════════════════════════════════════════
     if (!senderIsCreator && !isAdmin) return
 
-    // FIX BUG-14: always reply to senderJid — whoever sent the command
-    const replyTo = senderJid
-
-    // ─── /set difficulty ─────────────────────────
-    if (cmd[0] === 'set' && cmd[1] === 'difficulty') {
-        const newDiff = cmd[2]
-        if (['easy', 'normal', 'difficult'].includes(newDiff)) {
-            writeSetting(tier, 'difficulty', newDiff, settings)
-            saveSettings()
-            // DM confirmation to the admin/creator
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚙️ Difficulty set to: ${difficultyBadge(newDiff)} 🎯`
-            })
-            // Also announce in the group where the command was typed
-            // so players know the mode has changed
-            if (sender && sender !== replyTo && (sender.includes('@g.us') || sender.includes('@s.whatsapp.net'))) {
-                try {
-                    await sock.sendMessage(sender, {
-                        text: `📢 *Game mode updated!*
-
-🎯 Difficulty is now: ${difficultyBadge(newDiff)}
-
-_Set by the admin._ 🛡️`
-                    })
-                } catch (_) {}
-            }
-        } else {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Invalid option. Choose: \`easy\` · \`normal\` · \`difficult\``
-            })
-        }
-        return
+    // ── Admin access scoping: a non-creator admin who has been scoped
+    // to a different game via /game setadminaccess is silently ignored
+    // on Hangman commands. The creator always bypasses this.
+    if (!senderIsCreator) {
+        const scope = settings.adminGameAccess || 'all'
+        if (scope !== 'all' && scope !== config.GAME_KEY) return
     }
 
-    // ─── /set admin ──────────────────────────────
+    const replyTo = senderJid
+
+    // ─── /hmg set admin ──────────────────────────
     if (cmd[0] === 'set' && cmd[1] === 'admin') {
         const newAdmin = (cmd[2] || '').replace(/[^0-9]/g, '')
         if (newAdmin) {
@@ -715,12 +614,10 @@ _Set by the admin._ 🛡️`
                 text:
                     `⚠️ *Confirm Admin Change?*\n\n` +
                     `New number: *${newAdmin}*\n\n` +
-                    `Type */wrg confirm* to apply, or */wrg cancel* to discard.`
+                    `Type */hmg confirm* to apply, or */hmg cancel* to discard.`
             })
         } else {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/wrg set admin [full number with country code]\``
-            })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/hmg set admin [full number with country code]\`` })
         }
         return
     }
@@ -734,9 +631,7 @@ _Set by the admin._ 🛡️`
             saveSettings()
             startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
             await sendSafeMessage(sock, replyTo, {
-                text:
-                    `✅ *Admin updated to* \`${settings.adminNumber}\`\n\n` +
-                    `New admin must send any message to the bot so their JID is captured. 📡`
+                text: `✅ *Admin updated to* \`${settings.adminNumber}\`\n\nNew admin must send any message to the bot so their JID is captured. 📡`
             })
             try {
                 await sendSafeMessage(sock, settings.adminNumber, {
@@ -744,18 +639,16 @@ _Set by the admin._ 🛡️`
                         `╔══════════════════════════╗\n` +
                         `   👑  You're the Admin\n` +
                         `╚══════════════════════════╝\n\n` +
-                        `Welcome! 🎉 You have been assigned as the *WRG Bot* administrator.\n\n` +
-                        `Type */wrg help* to see all your commands.\n\n` +
+                        `Welcome! 🎉 You have been assigned as the *${config.GAME_ACRONYM} Bot* administrator.\n\n` +
+                        `Type */hmg help* to see all your commands.\n\n` +
                         `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-                        `_WRG Bot · Sky Graphics_ 🎨`
+                        `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
                 })
             } catch (err) {
                 console.log('⚠️ Could not DM new admin:', err.message)
             }
         } else {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Nothing to confirm. Use \`/wrg set admin [number]\` first.`
-            })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Nothing to confirm. Use \`/hmg set admin [number]\` first.` })
         }
         return
     }
@@ -764,90 +657,72 @@ _Set by the admin._ 🛡️`
         if (pendingAdminChangeRef.value) {
             const cancelled = pendingAdminChangeRef.value.number
             pendingAdminChangeRef.value = null
-            await sendSafeMessage(sock, replyTo, {
-                text: `❌ Admin change to \`${cancelled}\` cancelled.`
-            })
+            await sendSafeMessage(sock, replyTo, { text: `❌ Admin change to \`${cancelled}\` cancelled.` })
         } else {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ Nothing to cancel.` })
         }
         return
     }
 
-    // ─── /set maxtries ───────────────────────────
-    // Accepts either a positive integer (manual override) or 'auto'
-    // (default — scales attempts with word length & difficulty, computed
-    // fresh each round in gameEngine.calcMaxTries / resolveRoundMaxTries).
+    // ─── /hmg set maxtries ───────────────────────
     if (cmd[0] === 'set' && cmd[1] === 'maxtries') {
         const arg = (cmd[2] || '').toLowerCase()
         if (arg === 'auto') {
             writeSetting(tier, 'maxTries', 'auto', settings)
             saveSettings()
             await sendSafeMessage(sock, replyTo, {
-                text: `⚙️ Max attempts: *AUTO* 🤖\nAttempts now scale with word length and difficulty each round.`
+                text: `⚙️ Max attempts: *AUTO* 🤖\nAttempts now scale with word length each round.`
             })
         } else {
             const n = parseInt(arg, 10)
             if (Number.isInteger(n) && n > 0) {
                 writeSetting(tier, 'maxTries', n, settings)
                 saveSettings()
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚙️ Max attempts per round: *${n}* 💥 (manual override)`
-                })
+                await sendSafeMessage(sock, replyTo, { text: `⚙️ Max attempts per round: *${n}* 💥 (manual override)` })
             } else {
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ Usage: \`/wrg set maxtries [positive number]\` or \`/wrg set maxtries auto\``
-                })
+                await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/hmg set maxtries [positive number]\` or \`/hmg set maxtries auto\`` })
             }
         }
         return
     }
 
-    // ─── /set public ─────────────────────────────
+    // ─── /hmg set public ─────────────────────────
     if (cmd[0] === 'set' && cmd[1] === 'public') {
         const mode = cmd[2]
         if (mode === 'on' || mode === 'off') {
             const newValue = (mode === 'on')
             writeSetting(tier, 'publicVisible', newValue, settings)
             saveSettings()
-            // Confirm using newValue directly — reading settings.publicVisible
-            // here would show stale data when the creator just wrote to
-            // creatorOverrides instead of the root settings object.
             await sendSafeMessage(sock, replyTo, {
                 text: newValue
                     ? `🔓 *Public Visibility: ON*\nNon-admins can interact with the bot. 👥`
                     : `🔒 *Public Visibility: OFF*\nNon-admins are completely silenced. 🤐`
             })
         } else {
-            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/wrg set public [on/off]\`` })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/hmg set public [on/off]\`` })
         }
         return
     }
 
-    // ─── /set start ──────────────────────────────
+    // ─── /hmg set start ──────────────────────────
     if (cmd[0] === 'set' && cmd[1] === 'start') {
         const mode = cmd[2]
         if (mode === 'on' || mode === 'off') {
             const newValue = (mode === 'on')
             writeSetting(tier, 'publicCanStart', newValue, settings)
             saveSettings()
-            // Same fix as /set public — confirm with newValue, not a
-            // possibly-stale read of the root settings object.
             await sendSafeMessage(sock, replyTo, {
                 text: newValue
-                    ? `🔓 *Public Game Starts: ON*\nAnyone can type WRG to open a lobby. 🎮`
+                    ? `🔓 *Public Game Starts: ON*\nAnyone can type *${config.PREFIX} start* to open a lobby. 🎮`
                     : `🔒 *Public Game Starts: OFF*\nOnly admin can open a lobby. 👑`
             })
         } else {
-            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/wrg set start [on/off]\`` })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/hmg set start [on/off]\`` })
         }
         return
     }
 
-    // ─── /set autojoin ────────────────────────────
-    // Controls whether the creator/admin automatically joins every lobby
-    // that opens. ON = auto-join with role badge. OFF = must type wrg join.
-    // Each role (creator/admin) has their own independent switch stored
-    // via writeSetting so creator's choice never overwrites admin's.
+    // ─── /hmg set autojoin ────────────────────────
     if (cmd[0] === 'set' && cmd[1] === 'autojoin') {
         const mode = cmd[2]
         if (mode === 'on' || mode === 'off') {
@@ -858,181 +733,98 @@ _Set by the admin._ 🛡️`
             await sendSafeMessage(sock, replyTo, {
                 text: newValue
                     ? `🟢 *Auto-Join: ON*\nYou (${roleLabel}) will automatically join every lobby when it opens. 🎮`
-                    : `🔴 *Auto-Join: OFF*\nYou (${roleLabel}) must type *!wrg join* to enter lobbies manually. 👋`
+                    : `🔴 *Auto-Join: OFF*\nYou (${roleLabel}) must type *${config.PREFIX} join* to enter lobbies manually. 👋`
             })
         } else {
-            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/wrg set autojoin [on/off]\`` })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/hmg set autojoin [on/off]\`` })
         }
         return
     }
 
-    // ─── Word pool commands ───────────────────────
+    // ─── Word pool commands (flat pool, no levels) ────────
     if (cmd[0] === 'addword') {
-        const level = cmd[1], word = cmd[2]
-        if (['easy', 'normal', 'difficult'].includes(level) && word) {
+        const word = cmd[1]
+        if (word) {
             const tw = word.trim().toLowerCase()
-            if (words[level].includes(tw)) {
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ *${tw.toUpperCase()}* is already in the *${level.toUpperCase()}* pool.`
-                })
-            } else if (words[level].length >= 10) {
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ *${level.toUpperCase()}* pool is full (max 10). Remove one first.`
-                })
+            if (words.includes(tw)) {
+                await sendSafeMessage(sock, replyTo, { text: `⚠️ *${tw.toUpperCase()}* is already in the pool.` })
+            } else if (!/^[a-z]{2,}$/.test(tw)) {
+                await sendSafeMessage(sock, replyTo, { text: `⚠️ Words must be letters only, at least 2 characters.` })
             } else {
-                words[level].push(tw)
+                words.push(tw)
                 saveWords()
-                await sendSafeMessage(sock, replyTo, {
-                    text: `✅ *${tw.toUpperCase()}* added to *${level.toUpperCase()}* pool. 📚`
-                })
+                await sendSafeMessage(sock, replyTo, { text: `✅ *${tw.toUpperCase()}* added to the pool (${tw.length} letters). 📚` })
             }
         } else {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/wrg addword [easy/normal/difficult] [word]\``
-            })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/hmg addword [word]\`` })
         }
         return
     }
 
     if (cmd[0] === 'removeword') {
-        const level = cmd[1], word = cmd[2]
-        if (['easy', 'normal', 'difficult'].includes(level) && word) {
+        const word = cmd[1]
+        if (word) {
             const tw    = word.trim().toLowerCase()
-            const index = words[level].indexOf(tw)
+            const index = words.indexOf(tw)
             if (index !== -1) {
-                words[level].splice(index, 1)
+                if (words.length <= 1) {
+                    await sendSafeMessage(sock, replyTo, { text: `⚠️ Cannot remove the last word — the pool would be empty.` })
+                    return
+                }
+                words.splice(index, 1)
                 saveWords()
-                await sendSafeMessage(sock, replyTo, {
-                    text: `🗑️ *${tw.toUpperCase()}* removed from *${level.toUpperCase()}* pool.`
-                })
+                await sendSafeMessage(sock, replyTo, { text: `🗑️ *${tw.toUpperCase()}* removed from the pool.` })
             } else {
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ *${tw.toUpperCase()}* not found in *${level.toUpperCase()}* pool.`
-                })
+                await sendSafeMessage(sock, replyTo, { text: `⚠️ *${tw.toUpperCase()}* not found in the pool.` })
             }
         } else {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/wrg removeword [easy/normal/difficult] [word]\``
-            })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/hmg removeword [word]\`` })
         }
         return
     }
 
     if (cmd[0] === 'listwords') {
-        const level = cmd[1]
-        if (['easy', 'normal', 'difficult'].includes(level)) {
-            const list = words[level].join(', ')
-            await sendSafeMessage(sock, replyTo, {
-                text: `📖 *${level.toUpperCase()} Pool:*\n\n${list || '[Empty — use /wrg addword to add words]'}`
-            })
-        } else {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/wrg listwords [easy/normal/difficult]\``
-            })
-        }
+        const list = words.slice().sort((a, b) => a.length - b.length).join(', ')
+        await sendSafeMessage(sock, replyTo, {
+            text: `📖 *Word Pool (${words.length}):*\n\n${list || '[Empty — use /hmg addword to add words]'}`
+        })
         return
     }
 
     if (cmd[0] === 'setwords') {
-        const level    = cmd[1]
-        const newWords = cmd.slice(2).map(w => w.trim().toLowerCase()).filter(Boolean)
-        if (['easy', 'normal', 'difficult'].includes(level) && newWords.length > 0) {
-            if (newWords.length > 10) {
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ Maximum 10 words per pool. You provided ${newWords.length}.`
-                })
+        const newWords = cmd.slice(1).map(w => w.trim().toLowerCase()).filter(Boolean)
+        if (newWords.length > 0) {
+            if (newWords.length > 60) {
+                await sendSafeMessage(sock, replyTo, { text: `⚠️ Maximum 60 words in the pool. You provided ${newWords.length}.` })
             } else {
-                words[level] = [...new Set(newWords)]
+                const unique = [...new Set(newWords)]
+                words.length = 0
+                words.push(...unique)
                 saveWords()
-                await sendSafeMessage(sock, replyTo, {
-                    text: `✅ *${level.toUpperCase()}* pool replaced with ${words[level].length} word(s). 📚`
-                })
+                await sendSafeMessage(sock, replyTo, { text: `✅ Pool replaced with ${words.length} word(s). 📚` })
             }
         } else {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/wrg setwords [easy/normal/difficult] word1 word2 ...\``
-            })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/hmg setwords word1 word2 ...\`` })
         }
         return
     }
 
     if (cmd[0] === 'clearwords') {
-        const level = cmd[1]
-        if (['easy', 'normal', 'difficult'].includes(level)) {
-            const otherLevels   = ['easy', 'normal', 'difficult'].filter(l => l !== level)
-            const otherHasWords = otherLevels.some(l => words[l] && words[l].length > 0)
-            if (!otherHasWords) {
-                await sendSafeMessage(sock, replyTo, {
-                    text:
-                        `⚠️ *Cannot clear ${level.toUpperCase()} pool.*\n\n` +
-                        `It's the only pool with words. Clearing it would crash the game when a word is picked.\n\n` +
-                        `Add words to another pool first, then clear this one. 📚`
-                })
-                return
-            }
-            words[level] = []
-            saveWords()
-            await sendSafeMessage(sock, replyTo, {
-                text: `🗑️ *${level.toUpperCase()}* pool cleared.`
-            })
-        } else {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/wrg clearwords [easy/normal/difficult]\``
-            })
-        }
+        await sendSafeMessage(sock, replyTo, {
+            text: `⚠️ Word pool can't be fully cleared — it would crash the game. Use \`/hmg setwords\` to replace it instead.`
+        })
         return
     }
 
-    if (cmd[0] === 'setallwords') {
-        const payload  = cmd.slice(1).join(' ')
-        const segments = payload.split(/\s+(?=(easy|normal|difficult):)/i).filter(Boolean)
-        const newPools = {}
-        let valid = true
-        for (const segment of segments) {
-            const colonIdx = segment.indexOf(':')
-            if (colonIdx === -1) { valid = false; break }
-            const level = segment.slice(0, colonIdx).trim().toLowerCase()
-            const list  = segment.slice(colonIdx + 1)
-            if (!['easy', 'normal', 'difficult'].includes(level)) { valid = false; break }
-            const items = list.split(',').map(w => w.trim().toLowerCase()).filter(Boolean)
-            if (items.length > 10) {
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ *${level.toUpperCase()}* may not have more than 10 words.`
-                })
-                valid = false; break
-            }
-            newPools[level] = [...new Set(items)]
-        }
-        if (valid && Object.keys(newPools).length > 0) {
-            for (const level of ['easy', 'normal', 'difficult']) {
-                if (newPools[level]) words[level] = newPools[level]
-            }
-            saveWords()
-            await sendSafeMessage(sock, replyTo, {
-                text: `✅ Pools updated: ${Object.keys(newPools).map(l => l.toUpperCase()).join(', ')} 📚`
-            })
-        } else if (valid) {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/wrg setallwords easy:w1,w2 normal:w3 difficult:w4\``
-            })
-        }
-        return
-    }
-
-    // ─── /clearadmin ─────────────────────────────
-    // Clears the admin slot AND the admin's settings layer (difficulty,
-    // publicVisible, publicCanStart, maxTries reset to defaults) since that
-    // layer belongs to whoever is admin. Word pools and creatorOverrides
-    // are untouched — those are shared/creator-owned, not admin-owned.
+    // ─── /hmg clearadmin ─────────────────────────
     if (cmd[0] === 'clearadmin') {
         const cleared = settings.adminNumber
         settings.adminNumber    = ''
         settings.adminJid       = ''
-        settings.difficulty     = 'easy'
         settings.maxTries       = 'auto'
         settings.publicVisible  = true
         settings.publicCanStart = false
-        settings.autoJoin       = true   // reset admin auto-join to default ON
+        settings.autoJoin       = true
         pendingAdminChangeRef.value = null
         saveSettings()
         if (adminInactivityTimer) {
@@ -1042,29 +834,19 @@ _Set by the admin._ 🛡️`
         await sendSafeMessage(sock, replyTo, {
             text:
                 `✅ *Admin slot cleared.*\n\n` +
-                `${cleared || 'No admin'} has been removed and the admin-layer settings (difficulty, max tries, public access) were reset to defaults.\n\n` +
-                `Word pools and any creator overrides are untouched.\n\n` +
-                `The next */wrg admin* request will begin a fresh onboarding. 🔑`
+                `${cleared || 'No admin'} has been removed and the admin-layer settings (max tries, public access) were reset to defaults.\n\n` +
+                `Word pool and any creator overrides are untouched.\n\n` +
+                `The next */hmg admin* request will begin a fresh onboarding. 🔑`
         })
         return
     }
 
-    // ─── /reset ──────────────────────────────────
-    // PER SPEC'S EXPLICIT CORRECTION (overrides the earlier body text in the
-    // same doc): /reset must NOT remove the admin. It only resets settings,
-    // creatorOverrides, and word pools to defaults. The admin keeps their
-    // slot and access. The ONLY command that removes admin status is
-    // /clearadmin — keeping each command single-purpose and focused.
+    // ─── /hmg reset ──────────────────────────────
     if (cmd[0] === 'reset') {
         const keepAdminNumber = settings.adminNumber
         const keepAdminJid    = settings.adminJid
         Object.assign(settings, {
-            difficulty: 'easy', maxTries: 'auto',
-            // NOTE: prefix/adminPrefix are intentionally NOT reset here.
-            // The live values ('!wrg' / '/wrg ') are the current command
-            // namespace the whole bot depends on — reverting to the old
-            // pre-rewrite values ('wrg' / '/') would silently break every
-            // command, including /wrg reset itself, on the very next message.
+            maxTries: 'auto',
             publicVisible: true, publicCanStart: false
         })
         delete settings.creatorOverrides
@@ -1072,12 +854,17 @@ _Set by the admin._ 🛡️`
         settings.adminJid    = keepAdminJid
         saveSettings()
         pendingAdminChangeRef.value = null
-        Object.assign(words, JSON.parse(JSON.stringify(DEFAULT_WORDS)))
+
+        const { DEFAULT_WORDS } = require('./gameEngine')
+        words.length = 0
+        words.push(...DEFAULT_WORDS)
         saveWords()
+
         for (const key in games) {
             const g = games[key]
-            if (g.lobbyTimer) clearInterval(g.lobbyTimer)
-            if (g.turnTimer)  clearInterval(g.turnTimer)
+            if (g.lobbyTimer)    clearInterval(g.lobbyTimer)
+            if (g.turnTimer)     clearInterval(g.turnTimer)
+            if (g.cooldownTimer) clearInterval(g.cooldownTimer)
             delete games[key]
         }
         const GAMES_FILE = 'games.json'
@@ -1086,25 +873,23 @@ _Set by the admin._ 🛡️`
         await sendSafeMessage(sock, replyTo, {
             text:
                 `🔄 *Reset Complete* ✅\n\n` +
-                `Settings, creator overrides, and word pools restored to defaults. Any active game was ended.\n\n` +
+                `Settings, creator overrides, and the word pool were restored to defaults. Any active game was ended.\n\n` +
                 (keepAdminNumber
-                    ? `👑 Admin (\`${keepAdminNumber}\`) keeps their access — use */wrg clearadmin* if you want to remove them too.`
-                    : `The bot has no admin set — the next */wrg admin* request will begin onboarding.`)
+                    ? `👑 Admin (\`${keepAdminNumber}\`) keeps their access — use */hmg clearadmin* if you want to remove them too.`
+                    : `The bot has no admin set — the next */hmg admin* request will begin onboarding.`)
         })
         return
     }
 
-    // ─── /status ─────────────────────────────────
+    // ─── /hmg status ─────────────────────────────
     if (cmd[0] === 'status') {
-        // FIX BUG-13: pass games as second arg to getGameState
         const activeGameChat = activeGameChatRef.value
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, {
                 text:
-                    `📊 *WRG Bot Status*\n\n` +
+                    `📊 *${config.GAME_ACRONYM} Bot Status*\n\n` +
                     `🎮 No game or lobby is currently active.\n\n` +
                     `*Config:*\n` +
-                    `› Difficulty: *${(resolveSetting('difficulty', settings, 'easy') || 'easy').toUpperCase()}*\n` +
                     `› Max Tries: *${formatMaxTries(resolveSetting('maxTries', settings, 'auto'))}*\n` +
                     `› Public Visible: *${resolveSetting('publicVisible', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
                     `› Public Can Start: *${resolveSetting('publicCanStart', settings, false) ? '🟢 ON' : '🔴 OFF'}*\n` +
@@ -1113,17 +898,19 @@ _Set by the admin._ 🛡️`
             })
         } else {
             const gs = getGameState(activeGameChat, games)
-            let statusText = `📊 *WRG Bot Status*\n\n`
+            let statusText = `📊 *${config.GAME_ACRONYM} Bot Status*\n\n`
 
-            if (gs.lobbyActive) {
+            if (gs.cooldownActive) {
+                statusText += `☕ *COOLDOWN* — ${activeGameChat}\n`
+                statusText += `⏱️ Next lobby opens in: *${gs.cooldownSecondsLeft}s*\n`
+                statusText += `📏 Next word length: *~${gs.wordLengthTarget} letters*\n`
+            } else if (gs.lobbyActive) {
                 statusText += `🏠 *LOBBY OPEN* — ${activeGameChat}\n`
                 statusText += `👥 Players joined: *${gs.players.length}*\n`
                 statusText += `⏱️ Time left: *${gs.lobbySecondsLeft}s*\n`
                 if (gs.players.length > 0) {
                     statusText += `\n*Players:*\n`
-                    gs.players.forEach((num, i) => {
-                        statusText += `${i + 1}. ${gs.playerNames[num] || num}\n`
-                    })
+                    gs.players.forEach((num, i) => { statusText += `${i + 1}. ${gs.playerNames[num] || num}\n` })
                 }
             } else if (gs.active) {
                 const currentPlayer = gs.players[gs.currentTurnIndex]
@@ -1139,7 +926,6 @@ _Set by the admin._ 🛡️`
             }
 
             statusText += `\n*Config:*\n`
-            statusText += `› Difficulty: *${(resolveSetting('difficulty', settings, 'easy') || 'easy').toUpperCase()}*\n`
             statusText += `› Max Tries: *${formatMaxTries(resolveSetting('maxTries', settings, 'auto'))}*`
 
             await sendSafeMessage(sock, replyTo, { text: statusText })
@@ -1150,41 +936,24 @@ _Set by the admin._ 🛡️`
     // ─── Game control commands ────────────────────
     const activeGameChat = activeGameChatRef.value
 
-    // /wrg start — force lobby to close and game to begin immediately.
-    // Admin types this IN THE GROUP where the lobby is open.
-    // Bot announces in the group AND sends confirmation to admin DM.
     if (cmd[0] === 'start') {
         if (!activeGameChat) {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ No active lobby to force-start. Open one with *!wrg start* in the group first.`
-            })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ No active lobby to force-start. Open one with *${config.PREFIX} start* in the group first.` })
         } else {
             const gs = getGameState(activeGameChat, games)
             if (gs.lobbyActive) {
                 if (gs.lobbyTimer) clearInterval(gs.lobbyTimer)
-                // Announce in the group where the game is happening
                 await sock.sendMessage(activeGameChat, {
-                    text:
-                        `⚡ *Game starting early!*
-
-` +
-                        `The admin has force-started the game. Lobby is now closed — let's go! 🎮`
+                    text: `⚡ *Game starting early!*\n\nThe admin has force-started the game. Lobby is now closed — let's go! 🎮`
                 })
-                // Confirm to admin DM
-                await sendSafeMessage(sock, replyTo, {
-                    text: `▶️ *Force-start sent.* Game is launching now in the group. ⚡`
-                })
+                await sendSafeMessage(sock, replyTo, { text: `▶️ *Force-start sent.* Game is launching now in the group. ⚡` })
                 await startActualGame(activeGameChat, {
                     sock, games, settings, words, activeGameChatRef, persistGames, nameCache
                 })
             } else if (gs.active) {
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ The game is already in progress — use */wrg end* to stop it first.`
-                })
+                await sendSafeMessage(sock, replyTo, { text: `⚠️ The game is already in progress — use */hmg end* to stop it first.` })
             } else {
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ No active lobby found. Open one with *!wrg start* in the group.`
-                })
+                await sendSafeMessage(sock, replyTo, { text: `⚠️ No active lobby found. Open one with *${config.PREFIX} start* in the group.` })
             }
         }
         return
@@ -1194,19 +963,14 @@ _Set by the admin._ 🛡️`
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ No active game to pause right now.` })
         } else {
-            // FIX BUG-13: pass games to getGameState
             const gs = getGameState(activeGameChat, games)
             if (gs.active && !gs.paused) {
                 gs.paused = true
                 persistGames()
                 await sendSafeMessage(sock, replyTo, { text: `⏸️ *Game paused.* ✅` })
-                await sock.sendMessage(activeGameChat, {
-                    text: `⏸️ *Game paused by the admin.* Sit tight — we'll be right back! ☕`
-                })
+                await sock.sendMessage(activeGameChat, { text: `⏸️ *Game paused by the admin.* Sit tight — we'll be right back! ☕` })
             } else {
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ Game is already paused or no round is in progress.`
-                })
+                await sendSafeMessage(sock, replyTo, { text: `⚠️ Game is already paused or no round is in progress.` })
             }
         }
         return
@@ -1216,23 +980,15 @@ _Set by the admin._ 🛡️`
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ No active game to resume right now.` })
         } else {
-            // FIX BUG-13: pass games to getGameState
             const gs = getGameState(activeGameChat, games)
             if (gs.active && gs.paused) {
                 gs.paused = false
                 persistGames()
                 await sendSafeMessage(sock, replyTo, { text: `▶️ *Game resumed!* ✅` })
-                await sock.sendMessage(activeGameChat, {
-                    text: `▶️ *Game resumed by the admin!* Back in action — keep guessing! 🔥`
-                })
-                // FIX BUG-12: pass both chatId and a valid ctx to startTurnCountdown
-                startTurnCountdown(activeGameChat, {
-                    sock, games, settings, activeGameChatRef, persistGames, nameCache: ctx.nameCache
-                })
+                await sock.sendMessage(activeGameChat, { text: `▶️ *Game resumed by the admin!* Back in action — keep guessing! 🔥` })
+                startTurnCountdown(activeGameChat, { sock, games, settings, activeGameChatRef, persistGames, nameCache: ctx.nameCache })
             } else {
-                await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ Game is not currently paused.`
-                })
+                await sendSafeMessage(sock, replyTo, { text: `⚠️ Game is not currently paused.` })
             }
         }
         return
@@ -1242,13 +998,14 @@ _Set by the admin._ 🛡️`
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ No active game or lobby to end right now.` })
         } else {
-            // FIX BUG-13: pass games to getGameState
             const gs        = getGameState(activeGameChat, games)
             const endedChat = activeGameChat
             gs.active = false
             gs.lobbyActive = false
-            if (gs.lobbyTimer) clearInterval(gs.lobbyTimer)
-            if (gs.turnTimer)  clearInterval(gs.turnTimer)
+            gs.cooldownActive = false
+            if (gs.lobbyTimer)    clearInterval(gs.lobbyTimer)
+            if (gs.turnTimer)     clearInterval(gs.turnTimer)
+            if (gs.cooldownTimer) clearInterval(gs.cooldownTimer)
             gs.players = []
             gs.playerNames = {}
             gs.playerJids = {}
@@ -1258,9 +1015,7 @@ _Set by the admin._ 🛡️`
             activeGameChatRef.value = null
             persistGames()
             await sendSafeMessage(sock, replyTo, { text: `🛑 *Game terminated.* ✅` })
-            await sock.sendMessage(endedChat, {
-                text: `🛑 *Game terminated by the admin.* Thanks for playing, everyone! 👋`
-            })
+            await sock.sendMessage(endedChat, { text: `🛑 *Game terminated by the admin.* Thanks for playing, everyone! 👋` })
         }
         return
     }

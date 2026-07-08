@@ -1,8 +1,8 @@
 // ============================================================
-//  index.js — WRG Bot · Sky Graphics
-//  Thin orchestrator: connection, message routing.
-//  Game logic  → gameEngine.js
-//  Admin logic → adminCommands.js
+//  index.js — HMG Bot · Sky Graphics
+//  Thin orchestrator: connection, sender resolution, message
+//  routing. All game logic lives in each game's own folder
+//  (see games-registry.js). Nothing here is game-specific.
 // ============================================================
 
 require('dotenv').config()
@@ -10,22 +10,16 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = requi
 const { Boom } = require('@hapi/boom')
 const qrcode = require('qrcode-terminal')
 const fs = require('fs')
-const matchSummary = require('./matchSummary')
+const path = require('path')
 
-const {
-    DEFAULT_WORDS,
-    getGameState,
-    startLobbyCountdown,
-    startActualGame,
-    sendGameBoard,
-    startTurnCountdown
-} = require('./gameEngine')
+const registry = require('./games-registry')
+const { getTier, TIERS, resolveSetting } = require('./permissions')
+const { handleGameSwitchCommands } = require('./game-switch-commands')
 
-const {
-    getTier, nameTag, difficultyBadge, TIERS, resolveSetting
-} = require('./permissions')
-
-const { handleAdminCommand } = require('./adminCommands')
+// Fixed, game-independent prefix. Always works no matter which game is
+// currently active, so the creator never needs to know/guess the active
+// game's own acronym just to switch away from it.
+const GAME_SWITCH_PREFIX = '/game '
 
 // ─── Safe DM sender ───────────────────────────────────────
 async function sendSafeMessage(sock, jidOrNumber, payload) {
@@ -40,18 +34,17 @@ async function sendSafeMessage(sock, jidOrNumber, payload) {
 
 // ─── Persistent Settings ───────────────────────────────────
 const SETTINGS_FILE = 'settings.json'
-const WORDS_FILE    = 'words.json'
-const GAMES_FILE    = 'games.json'
+const WORDS_FILE     = 'words.json'
+const GAMES_FILE     = 'games.json'
 
 let settings = {
-    adminNumber:    '',
-    adminJid:       '',
-    difficulty:     'easy',
-    maxTries:       'auto',
-    prefix:         '!wrg',
-    adminPrefix:    '/wrg ',
-    publicVisible:  true,
-    publicCanStart: false
+    adminNumber:      '',
+    adminJid:         '',
+    maxTries:         'auto',
+    publicVisible:    true,
+    publicCanStart:   false,
+    activeGame:       'hangman',   // which game module is currently live
+    adminGameAccess:  'all'        // which game(s) the confirmed admin may operate
 }
 
 let pendingAdminChangeRef = { value: null }
@@ -60,10 +53,9 @@ if (fs.existsSync(SETTINGS_FILE)) {
     settings = JSON.parse(fs.readFileSync(SETTINGS_FILE))
     if (typeof settings.adminJid        === 'undefined') settings.adminJid        = ''
     if (typeof settings.publicVisible   === 'undefined') settings.publicVisible   = true
-    if (typeof settings.publicCanStart  === 'undefined') {
-        settings.publicCanStart = typeof settings.publicStart !== 'undefined' ? settings.publicStart : false
-        delete settings.publicStart
-    }
+    if (typeof settings.publicCanStart  === 'undefined') settings.publicCanStart  = false
+    if (typeof settings.activeGame      === 'undefined') settings.activeGame      = 'hangman'
+    if (typeof settings.adminGameAccess === 'undefined') settings.adminGameAccess = 'all'
 }
 
 function saveSettings() {
@@ -85,26 +77,9 @@ function rememberName(number, pushName) {
     }
 }
 
-function displayName(number) {
-    return nameCache[number] || number
-}
-
-function jidOf(number) {
-    if (!number) return ''
-    if (number.includes('@')) return number
-    return `${number}@s.whatsapp.net`
-}
-
-function resolveJid(number, playerJids) {
-    if (!number) return ''
-    if (number.includes('@')) return number
-    return (playerJids && playerJids[number]) || `${number}@s.whatsapp.net`
-}
-
 // ─── LID → PN cache ───────────────────────────────────────
-// WhatsApp now routes many messages via internal LIDs (e.g. 187733758767332@lid)
-// instead of real phone-number JIDs. This cache maps each LID to its real PN
-// so we never display or store a LID as if it were a phone number.
+// WhatsApp routes many messages via internal LIDs (e.g. 187733758767332@lid)
+// instead of real phone-number JIDs. This cache maps each LID to its real PN.
 // Persisted to lidcache.json so resolutions survive bot restarts.
 const LID_CACHE_FILE = 'lidcache.json'
 let lidCache = {}
@@ -116,32 +91,16 @@ function saveLidCache() {
     fs.writeFileSync(LID_CACHE_FILE, JSON.stringify(lidCache, null, 2))
 }
 
-// Resolves a LID (e.g. "77705185873989@lid") to a real phone number string.
-//
-// Resolution order — most reliable first:
-//   1. Local lidCache (persisted to lidcache.json across restarts)
-//   2. sock.signalRepository.lidMapping.getPNForLID() — reads from Baileys'
-//      internal store populated during initial sync (no network call, fast).
-//      This is the fix: the previous code only tried onWhatsApp() which
-//      explicitly does NOT support LIDs and always fails.
-//   3. sock.onWhatsApp() — kept as last resort; usually fails for LIDs but
-//      occasionally works on older Baileys builds.
-//
-// Returns the plain PN string (e.g. "237682477421") or '' if unresolvable.
+// Resolves a LID to a real phone number string.
+// Order: local cache → sock.signalRepository.lidMapping.getPNForLID() → sock.onWhatsApp() last resort.
 async function resolvelidToPN(sock, lid) {
     if (!lid || !lid.includes('@lid')) return ''
 
-    // ── 1. Local cache ───────────────────────────────────────
     if (lidCache[lid]) {
         console.log(`[lid] Cache hit: ${lid} → ${lidCache[lid]}`)
         return lidCache[lid]
     }
 
-    // ── 2. Baileys internal signal repository (LOCAL — no network) ──
-    // getLIDForPN/getPNForLID read from lid-mapping-*.json written to
-    // auth_info/ during initial sync. This is the correct API per Baileys
-    // v7 migration docs. lid-mapping.update is never emitted in production
-    // (confirmed GitHub issue #2416) — query the store directly instead.
     try {
         const pnJid = await sock.signalRepository?.lidMapping?.getPNForLID(lid)
         if (pnJid) {
@@ -157,7 +116,6 @@ async function resolvelidToPN(sock, lid) {
         console.log(`[lid] signalRepository lookup failed for ${lid}:`, err.message)
     }
 
-    // ── 3. WhatsApp server query (last resort — usually fails for LIDs) ──
     try {
         const results = await sock.onWhatsApp(lid)
         if (results && results.length > 0) {
@@ -177,8 +135,8 @@ async function resolvelidToPN(sock, lid) {
 }
 
 // ─── Idempotency guard ─────────────────────────────────────
-const recentlySeenIds  = new Map()
-const DEDUP_WINDOW_MS  = 2 * 60 * 1000
+const recentlySeenIds = new Map()
+const DEDUP_WINDOW_MS = 2 * 60 * 1000
 
 function isDuplicateMessage(msgId) {
     if (!msgId) return false
@@ -191,27 +149,29 @@ function isDuplicateMessage(msgId) {
     return false
 }
 
-// ─── Word Pools ────────────────────────────────────────────
-let words = JSON.parse(JSON.stringify(DEFAULT_WORDS))
-
-function saveWords() {
-    fs.writeFileSync(WORDS_FILE, JSON.stringify(words, null, 2))
+// ─── Word Pool (belongs to whichever game is active) ───────
+// words.json is a flat array. Only one game is active at a time, and
+// today's only game (Hangman) uses a flat word list; a future game
+// that needs a different shape should manage its own file instead.
+function loadWordsForGame(game) {
+    if (fs.existsSync(WORDS_FILE)) {
+        try {
+            const saved = JSON.parse(fs.readFileSync(WORDS_FILE))
+            if (Array.isArray(saved) && saved.length > 0) return saved
+        } catch (_) {}
+    }
+    return JSON.parse(JSON.stringify((game && game.gameEngine.DEFAULT_WORDS) || []))
 }
 
-if (fs.existsSync(WORDS_FILE)) {
-    words = JSON.parse(fs.readFileSync(WORDS_FILE))
-}
-
-// ─── Game State ────────────────────────────────────────────
-const games = {}
 let activeGameChatRef = { value: null }
+const games = {}
 
 function persistGames() {
     const serializable = {}
     for (const chatId in games) {
         const g = games[chatId]
-        if (!g.active && !g.lobbyActive) continue
-        const { lobbyTimer, turnTimer, ...rest } = g
+        if (!g.active && !g.lobbyActive && !g.cooldownActive) continue
+        const { lobbyTimer, turnTimer, cooldownTimer, ...rest } = g
         serializable[chatId] = rest
     }
     fs.writeFileSync(GAMES_FILE, JSON.stringify({ activeGameChat: activeGameChatRef.value, games: serializable }, null, 2))
@@ -223,11 +183,7 @@ function loadPersistedGames() {
         const data = JSON.parse(fs.readFileSync(GAMES_FILE))
         activeGameChatRef.value = data.activeGameChat || null
         for (const chatId in (data.games || {})) {
-            games[chatId] = {
-                ...data.games[chatId],
-                lobbyTimer: null,
-                turnTimer:  null
-            }
+            games[chatId] = { ...data.games[chatId], lobbyTimer: null, turnTimer: null, cooldownTimer: null }
         }
     } catch (err) {
         console.log('⚠️ Could not load persisted game state (games.json may be corrupt). Starting fresh.', err.message)
@@ -236,23 +192,33 @@ function loadPersistedGames() {
 
 loadPersistedGames()
 
+let words = loadWordsForGame(registry.getActiveGame(settings))
+
+function saveWords() {
+    fs.writeFileSync(WORDS_FILE, JSON.stringify(words, null, 2))
+}
+
 let hasSentBootAdminConfirmation = false
 
 // ─── Shared engine context builder ─────────────────────────
-// FIX BUG-05: nameCache is now included so gameEngine.startTurnCountdown
-// can use it for player name display during turn warnings.
-// FIX BUG-05: removed jidOf and tag — gameEngine uses nameTag from permissions.js
 function buildCtx(sock) {
-    return {
-        sock,
-        games,
-        settings,
-        words,
-        activeGameChatRef,
-        persistGames,
-        nameCache,
-        DEFAULT_WORDS
+    return { sock, games, settings, words, activeGameChatRef, persistGames, nameCache }
+}
+
+// ─── Public-message dispatch helper ─────────────────────────
+// Hangman keeps its public "!hmg ..." + live-guess handling in its own
+// publicCommands.js (separate from gameEngine.js, which is pure state
+// mechanics). Any future game can do the same, or expose
+// gameEngine.handlePublicMessage directly — both shapes are supported.
+function getPublicMessageHandler(activeGame) {
+    if (typeof activeGame.gameEngine.handlePublicMessage === 'function') {
+        return activeGame.gameEngine.handlePublicMessage
     }
+    const publicHandlerPath = path.join(__dirname, activeGame.folderName, 'publicCommands.js')
+    if (fs.existsSync(publicHandlerPath)) {
+        return require(publicHandlerPath).handlePublicMessage
+    }
+    return null
 }
 
 // ─── Main Bot ──────────────────────────────────────────────
@@ -260,9 +226,9 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info')
 
     const sock = makeWASocket({
-        auth:                state,
-        printQRInTerminal:   false,
-        getMessage:          async () => ({ conversation: '' })
+        auth:              state,
+        printQRInTerminal: false,
+        getMessage:        async () => ({ conversation: '' })
     })
 
     sock.ev.on('creds.update', saveCreds)
@@ -288,32 +254,20 @@ async function startBot() {
         }
 
         if (connection === 'open') {
-            console.log('✅ WRG Bot is connected! 🎮')
+            const activeGame = registry.getActiveGame(settings)
+            console.log(`✅ HMG Bot is connected! Active game: ${activeGame ? activeGame.config.GAME_NAME : 'NONE LOADED'} 🎮`)
 
-            // ── Seed LID↔PN mappings from every available source on boot ──────
-            // We do this BEFORE sending the boot DM so that by the time the creator
-            // reads their DM and replies, their LID is already in lidCache and
-            // getTier() will correctly return CREATOR for their messages.
-            //
-            // Source A: sock.signalRepository.lidMapping.getLIDForPN()
-            //   Queries the local store for the creator's PN → LID mapping.
-            //   This is populated during initial sync from the main device.
-            //
-            // Source B: auth_info/lid-mapping-*.json files
-            //   Baileys v7 writes all known LID↔PN pairs to these files.
-            //   Reading them directly is the most reliable approach (confirmed
-            //   GitHub issue #2416: lid-mapping.update event never fires).
+            // Seed LID↔PN mappings from every available source on boot.
             ;(async () => {
                 const creatorJidEnv = process.env.CREATOR_JID || ''
                 const creatorNum    = creatorJidEnv.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
 
-                // Source A — signal repository getLIDForPN
                 if (creatorNum && sock.signalRepository?.lidMapping?.getLIDForPN) {
                     try {
                         const creatorPnJid = `${creatorNum}@s.whatsapp.net`
                         const creatorLid   = await sock.signalRepository.lidMapping.getLIDForPN(creatorPnJid)
                         if (creatorLid) {
-                            const lidBase = creatorLid.split(':')[0]  // strip device suffix
+                            const lidBase = creatorLid.split(':')[0]
                             const fullLid = lidBase.includes('@') ? lidBase : `${lidBase}@lid`
                             if (!lidCache[fullLid]) {
                                 lidCache[fullLid] = creatorNum
@@ -326,7 +280,6 @@ async function startBot() {
                     }
                 }
 
-                // Source B — read all auth_info/lid-mapping-*.json files
                 try {
                     const authDir = 'auth_info'
                     if (fs.existsSync(authDir)) {
@@ -336,7 +289,6 @@ async function startBot() {
                             try {
                                 const raw  = fs.readFileSync(`${authDir}/${fname}`, 'utf8')
                                 const data = JSON.parse(raw)
-                                // Baileys stores these as { lid: pnJid } or [{ lid, pn }] — handle both shapes
                                 const entries = Array.isArray(data) ? data : Object.entries(data).map(([lid, pn]) => ({ lid, pn }))
                                 for (const entry of entries) {
                                     const lid = entry.lid || entry[0] || ''
@@ -361,20 +313,21 @@ async function startBot() {
                 }
             })()
 
-            // FIX BUG-09: boot DM to creator as well as admin
             if (!hasSentBootAdminConfirmation) {
                 hasSentBootAdminConfirmation = true
                 const creatorJid = process.env.CREATOR_JID || ''
+                const gameLabel  = activeGame ? `${activeGame.config.GAME_NAME} (${activeGame.config.GAME_ACRONYM})` : 'no game loaded'
+                const helpPrefix = activeGame ? activeGame.config.ADMIN_PREFIX.trim() : '/hmg'
 
-                // Always notify creator
                 if (creatorJid) {
                     try {
                         await sendSafeMessage(sock, creatorJid, {
                             text:
-                                `🔁 *WRG Bot is back online!* ✅\n\n` +
+                                `🔁 *Bot is back online!* ✅\n\n` +
+                                `🎮 Active game: *${gameLabel}*\n` +
                                 `👑 You're the *Creator* (unrestricted access).\n\n` +
-                                `Type */wrg help* to open your full dashboard.\n\n` +
-                                `_WRG Bot · by Sky Graphics_ 🎨`
+                                `Type *${helpPrefix} help* to open your full dashboard.\n\n` +
+                                `_Sky Graphics_ 🎨`
                         })
                         console.log(`🔐 Sent boot DM to creator`)
                     } catch (err) {
@@ -382,45 +335,46 @@ async function startBot() {
                     }
                 }
 
-                // Also notify admin if set and different from creator
                 const bootTarget = settings.adminJid || settings.adminNumber
                 const creatorNum = creatorJid.split('@')[0].split(':')[0]
                 if (bootTarget && settings.adminNumber !== creatorNum) {
                     try {
                         await sendSafeMessage(sock, bootTarget, {
                             text:
-                                `🔁 *WRG Bot is back online!* ✅\n\n` +
+                                `🔁 *Bot is back online!* ✅\n\n` +
+                                `🎮 Active game: *${gameLabel}*\n` +
                                 `👑 You're registered as admin (${settings.adminNumber}).\n\n` +
-                                `Type */wrg help* at any time to see all your commands.\n\n` +
-                                `_WRG Bot · by Sky Graphics_ 🎨`
+                                `Type *${helpPrefix} help* at any time to see all your commands.\n\n` +
+                                `_Sky Graphics_ 🎨`
                         })
                         console.log(`👑 Sent boot DM to admin ${bootTarget}`)
                     } catch (err) {
                         console.log('⚠️ Could not DM admin on boot:', err.message)
                     }
                 } else if (!bootTarget && !creatorJid) {
-                    console.log('ℹ️ No admin set yet. Someone must type /wrg admin to begin onboarding.')
+                    console.log(`ℹ️ No admin set yet. Someone must type ${helpPrefix} admin to begin onboarding.`)
                 }
             }
 
-            // Recover active game/lobby after restart
-            if (activeGameChatRef.value && games[activeGameChatRef.value]) {
+            // Recover active game/lobby/cooldown after restart
+            if (activeGameChatRef.value && games[activeGameChatRef.value] && activeGame) {
                 const gs  = games[activeGameChatRef.value]
                 const ctx = buildCtx(sock)
                 if (gs.lobbyActive) {
                     await sock.sendMessage(activeGameChatRef.value, {
-                        text: `🔁 *Bot restarted.* Resuming the lobby countdown (${gs.lobbySecondsLeft}s left). Type *!wrg join* if you haven't! ⏱️`
+                        text: `🔁 *Bot restarted.* Resuming the lobby countdown (${gs.lobbySecondsLeft}s left). Type *${activeGame.config.PREFIX} join* if you haven't! ⏱️`
                     })
-                    startLobbyCountdown(activeGameChatRef.value, ctx)
+                    activeGame.gameEngine.startLobbyCountdown(activeGameChatRef.value, ctx)
                 } else if (gs.active && !gs.paused) {
-                    await sock.sendMessage(activeGameChatRef.value, {
-                        text: `🔁 *Bot restarted.* Resuming the in-progress round. 🎮`
-                    })
-                    await sendGameBoard(activeGameChatRef.value, '🔁 *Round recovered after a restart.*', [], ctx)
+                    await sock.sendMessage(activeGameChatRef.value, { text: `🔁 *Bot restarted.* Resuming the in-progress round. 🎮` })
+                    await activeGame.gameEngine.sendGameBoard(activeGameChatRef.value, '🔁 *Round recovered after a restart.*', [], ctx)
                 } else if (gs.active && gs.paused) {
                     await sock.sendMessage(activeGameChatRef.value, {
-                        text: `🔁 *Bot restarted.* The round is still paused — an admin must type */wrg resume* to continue. ⏸️`
+                        text: `🔁 *Bot restarted.* The round is still paused — an admin must type *${activeGame.config.ADMIN_PREFIX.trim()} resume* to continue. ⏸️`
                     })
+                } else if (gs.cooldownActive && typeof activeGame.gameEngine.startCooldown === 'function') {
+                    await sock.sendMessage(activeGameChatRef.value, { text: `🔁 *Bot restarted.* Still on the post-round break. ☕` })
+                    activeGame.gameEngine.startCooldown(activeGameChatRef.value, ctx)
                 }
             }
         }
@@ -432,7 +386,6 @@ async function startBot() {
 
         for (const msg of messages) {
             if (!msg.message) continue
-
             if (isDuplicateMessage(msg.key?.id)) {
                 console.log(`[dedup] Skipping duplicate: ${msg.key.id}`)
                 continue
@@ -453,71 +406,38 @@ async function startBot() {
             const sender = msg.key.participant || msg.key.remoteJid || ''
 
             // ── senderNumber resolution ──────────────────────
-            // Rule: senderNumber must ALWAYS be a real phone number
-            // (country code + digits, e.g. "237682477421").
-            // A LID like "187733758767332" is NOT a phone number and must
-            // never be stored, displayed, or used as one.
-            //
-            // Priority 1 — participantPn: most reliable in groups on modern Baileys
-            // Priority 2 — senderPn: reliable when populated
-            // Priority 3 — fromMe: always the creator
-            // Priority 4 — participant/sender is @s.whatsapp.net: extract directly
-            // Priority 5 — LID: attempt sock.onWhatsApp() resolution
-            // Priority 6 — unresolved: allow slash commands through anyway,
-            //              block everything else to avoid processing garbage
             let senderNumber = ''
 
             if (msg.key.participantPn) {
-                // Group messages on modern Baileys — most reliable source
                 senderNumber = msg.key.participantPn.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
             }
-
             if (!senderNumber && msg.key.senderPn) {
-                // Direct PN field when populated
                 senderNumber = msg.key.senderPn.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
             }
-
             if (!senderNumber && msg.key.fromMe) {
-                // Message from the bot's own account = always the creator
                 const creatorJid = process.env.CREATOR_JID || ''
-                senderNumber = creatorJid
-                    ? creatorJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
-                    : ''
+                senderNumber = creatorJid ? creatorJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '') : ''
             }
-
             if (!senderNumber && sender && !sender.includes('@lid')) {
-                // Normal @s.whatsapp.net JID — number is in the JID itself
                 senderNumber = sender.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
             }
-
             if (!senderNumber && sender && sender.includes('@lid')) {
-                // LID — resolve to real PN. resolvelidToPN now tries the local
-                // signalRepository first, so this will succeed whenever Baileys
-                // has the mapping cached from the initial sync.
                 senderNumber = await resolvelidToPN(sock, sender)
-                if (!senderNumber) {
-                    console.log(`[lid] Could not resolve LID: ${sender}`)
-                }
+                if (!senderNumber) console.log(`[lid] Could not resolve LID: ${sender}`)
             }
-
-            // Validate: if we have a number, it must look like a real PN.
-            // If it doesn't pass — clear it so we know resolution failed.
             if (senderNumber && !/^[0-9]{7,15}$/.test(senderNumber)) {
                 console.log(`[senderNumber] Invalid PN resolved: "${senderNumber}" — clearing`)
                 senderNumber = ''
             }
 
-            // If senderNumber is still empty at this point:
-            // — Slash commands ALWAYS get through (e.g. /admin onboarding must work
-            //   even when PN resolution fails — senderJid is enough to reply to them)
-            // — Everything else is skipped to avoid processing unidentified messages
-            const isSlashCommand = body.startsWith(settings.adminPrefix)
+            // Any "/" message is treated as a slash command for the early gate —
+            // the specific active-game admin prefix is checked further below.
+            const isSlashCommand = body.startsWith('/')
             if (!senderNumber && !isSlashCommand) {
                 console.log(`[senderNumber] Could not resolve PN and not a slash command — skipping`)
                 continue
             }
 
-            // ── senderJid: the JID to DM this sender ─────────
             const senderJid = msg.key.fromMe
                 ? (process.env.CREATOR_JID || (senderNumber ? `${senderNumber}@s.whatsapp.net` : sender))
                 : (msg.key.participant || sender)
@@ -525,19 +445,48 @@ async function startBot() {
             const senderName = msg.pushName || senderNumber
             rememberName(senderNumber, msg.pushName)
 
-            // FIX BUG-01 + BUG-02: compute tier via getTier so permissions.js is the
-            // single source of truth. senderTier replaces the old inline isAdmin check.
-            const senderTier   = getTier(senderNumber, settings, senderJid)
-            const isAdmin      = senderTier === TIERS.CREATOR || senderTier === TIERS.ADMIN
+            const senderTier = getTier(senderNumber, settings, senderJid)
+            const isAdmin    = senderTier === TIERS.CREATOR || senderTier === TIERS.ADMIN
 
-            // Non-admins invisible unless publicVisible is on —
-            // EXCEPT slash-commands (always reach adminCommands for onboarding)
-            // FIX: read via resolveSetting() so a creator override on
-            // publicVisible always wins over the admin's raw setting.
+            // ── "/game ..." — fixed, game-independent switch commands ──
+            // Checked BEFORE active-game resolution so it works no matter
+            // which game is currently running, and no matter what that
+            // game's own prefix is. Creator-only; anyone else is ignored.
+            if (body.startsWith(GAME_SWITCH_PREFIX) || body === '/game') {
+                const parts = body.slice(1).trim().split(/\s+/) // ['game', 'setgame', 'wordladder']
+                const cmd   = parts.slice(1)                    // ['setgame', 'wordladder']
+                const senderIsCreator = senderTier === TIERS.CREATOR
+
+                const handled = await handleGameSwitchCommands({
+                    cmd, senderIsCreator, senderIsAdmin: isAdmin, sock, sendSafeMessage,
+                    replyTo: senderJid, settings, saveSettings
+                })
+
+                if (!handled && senderIsCreator) {
+                    await sendSafeMessage(sock, senderJid, {
+                        text:
+                            `🎮 *Game Switcher*\n\n` +
+                            `› \`/game setgame [key]\` — switch the active game\n` +
+                            `› \`/game setadminaccess [key|all]\` — scope the admin to one game\n` +
+                            `› \`/game status\` — show what's active and what's available\n\n` +
+                            `Available games: *${registry.listGameKeys().join(', ') || 'none loaded'}*`
+                    })
+                }
+                continue
+            }
+
+            // ── Resolve active game ──────────────────────────
+            const activeGame = registry.getActiveGame(settings)
+            if (!activeGame) {
+                console.log('[router] No game module loaded — ignoring message.')
+                continue
+            }
+            const adminPrefix = activeGame.config.ADMIN_PREFIX
+            const prefix       = activeGame.config.PREFIX
+
             const effectivePublicVisible = resolveSetting('publicVisible', settings, true)
-            if (!isAdmin && !effectivePublicVisible && !body.startsWith(settings.adminPrefix)) continue
+            if (!isAdmin && !effectivePublicVisible && !body.startsWith(adminPrefix)) continue
 
-            // Refresh admin JID on every inbound admin message
             if (senderNumber === settings.adminNumber) {
                 if (msg.pushName) rememberName(settings.adminNumber, msg.pushName)
                 if (sender && sender !== settings.adminJid) {
@@ -547,375 +496,41 @@ async function startBot() {
                 }
             }
 
-            // ── / Commands ──────────────────────────────────
-            if (body.startsWith(settings.adminPrefix)) {
-                const ctx = {
+            // ── "/" admin commands → active game's handler ──
+            if (body.startsWith(adminPrefix)) {
+                const cmdCtx = {
                     ...buildCtx(sock),
                     pendingAdminChangeRef,
                     saveSettings,
                     saveWords,
                     sendSafeMessage,
-                    // FIX BUG-03: correct 2-arg signature
-                    getGameState: (chatId, g) => getGameState(chatId, g || games),
-                    // FIX BUG-12: pass full ctx so resume works
-                    startTurnCountdown: (chatId, overrideCtx) => startTurnCountdown(chatId, overrideCtx || buildCtx(sock)),
-                    DEFAULT_WORDS,
+                    getGameState: (chatId, g) => activeGame.gameEngine.getGameState(chatId, g || games),
+                    startTurnCountdown: (chatId, overrideCtx) => activeGame.gameEngine.startTurnCountdown(chatId, overrideCtx || buildCtx(sock)),
                     fs,
                     senderNumber,
-                    // senderDisplayId: best available identifier for display/approval-queue
-                    // purposes when senderNumber resolution failed (LID-only requester).
-                    // Falls back to the raw sender JID's local part so /approve still
-                    // has something usable to match against.
                     senderDisplayId: senderNumber || sender.split('@')[0].split(':')[0] || '',
                     senderName,
                     senderJid,
                     sender: from,
                     body,
                     isAdmin,
-                    // FIX BUG-01: senderTier is now always defined here
                     senderTier
                 }
-                await handleAdminCommand(ctx)
+                await activeGame.adminCommands.handleAdminCommand(cmdCtx)
                 continue
             }
 
-            // ── !wrg start = open lobby ─────────────────────
-            // !wrg start opens the lobby (replaces old WRG all-caps)
-            // !wrg (alone, any case) shows ping + participant dashboard
-            const isAllCapsWRG = rawBody === '!wrg start' || rawBody === '!WRG START'
-            const isMixedWRG   = body === '!wrg' && rawBody.toLowerCase() === '!wrg'
+            // ── Everything else → active game's public handler ──
+            const handler = getPublicMessageHandler(activeGame)
+            if (!handler) continue
 
-            if (isMixedWRG) {
-                const pingStart = Date.now()
-                await sock.sendMessage(from, { text: '🏓 Ping!' })
-                await sock.sendMessage(from, { text: '🏓 Pong!' })
-                const pingMs = Date.now() - pingStart
-                await sock.sendMessage(from, { text: `⚡ *WRG Bot* | Response time: *${pingMs}ms*` })
-
-                await sock.sendMessage(from, {
-                    text:
-                        `━━━━━━━━━━━━━━━━━━━━━━\n` +
-                        `🎮 *Word Riddle Game Bot*\n` +
-                        `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-                        `Hey there! 👋 I'm the *WRG Bot* — a live multiplayer word-guessing game built for WhatsApp groups.\n\n` +
-                        `Players take turns guessing letters to reveal a hidden word. Miss 3 turns in a row and you're out! The last one standing wins. 🏆\n\n` +
-                        `_Created with ❤️ by_ *_Sky Graphics_* 🎨\n\n` +
-                        `━━━━━━━━━━━━━━━━━━━━━━\n` +
-                        `*🎮 How to Play:*\n\n` +
-                        `1️⃣ Type *!wrg start* to open a game lobby\n` +
-                        `2️⃣ Type *!wrg join* to enter the lobby\n` +
-                        `3️⃣ Lobby closes after 60 seconds — game begins automatically!\n` +
-                        `4️⃣ On your turn, type a *single letter* to guess, or the *full word* to win instantly\n` +
-                        `5️⃣ Miss *3 turns in a row* and you're disqualified 🚫\n` +
-                        `6️⃣ Last player standing wins! 🏆`
-                })
-                continue
+            const msgCtx = {
+                sock, games, settings, words, activeGameChatRef, persistGames, nameCache,
+                sendSafeMessage,
+                buildCtx: () => buildCtx(sock),
+                from, body, rawBody, senderNumber, senderJid, senderName, isAdmin
             }
-
-            if (isAllCapsWRG) {
-                // FIX: read via resolveSetting() — creator's override on
-                // publicCanStart must win over whatever the admin set.
-                const effectivePublicCanStart = resolveSetting('publicCanStart', settings, false)
-                if (!isAdmin && !effectivePublicCanStart) {
-                    await sock.sendMessage(from, {
-                        text: `🔒 *Game Locked*\nThe admin hasn't enabled public game starts. Only the admin can open a lobby right now.`
-                    })
-                    continue
-                }
-
-                if (activeGameChatRef.value) {
-                    if (activeGameChatRef.value === from) {
-                        await sock.sendMessage(from, {
-                            text: `⚠️ A game or lobby is *already active in this chat!* ⏳`
-                        })
-                    } else {
-                        await sock.sendMessage(from, {
-                            text: `⚠️ A game is currently running in another chat. It must end before a new one can start.`
-                        })
-                        const adminTarget = settings.adminJid || settings.adminNumber
-                        if (adminTarget) {
-                            try {
-                                await sendSafeMessage(sock, adminTarget, {
-                                    text:
-                                        `⚠️ *Duplicate Game Attempt*\n\n` +
-                                        `Someone tried to start a game in *${from}* while a game is already active in *${activeGameChatRef.value}*.\n\n` +
-                                        `Use */wrg end* to stop the current game if needed. 🎮`
-                                })
-                            } catch (_) {}
-                        }
-                    }
-                    continue
-                }
-
-                // FIX BUG-03: 2-arg call
-                const gameState = getGameState(from, games)
-                gameState.lobbyActive     = true
-                gameState.lobbySecondsLeft = 60
-                gameState.players         = []
-                gameState.playerNames     = {}
-                gameState.playerJids      = {}
-                gameState.skipStreaks     = {}
-                gameState.disqualified    = []
-
-                // Auto-join respects each role's individual autoJoin setting.
-                // Creator has their own switch (creatorOverrides.autoJoin).
-                // Admin has their own switch (settings.autoJoin).
-                // Default is ON for both if not explicitly set.
-                const creatorEnvJid    = process.env.CREATOR_JID || ''
-                const creatorNum       = creatorEnvJid ? creatorEnvJid.split('@')[0].split(':')[0] : ''
-                const creatorAutoJoin  = settings.creatorOverrides?.autoJoin !== false
-                const adminAutoJoin    = settings.autoJoin !== false
-
-                if (creatorNum && creatorAutoJoin && !gameState.players.includes(creatorNum)) {
-                    gameState.players.push(creatorNum)
-                    gameState.playerNames[creatorNum] = nameCache[creatorNum] || 'Creator'
-                    gameState.playerJids[creatorNum]  = creatorEnvJid
-                }
-                // Admin also auto-joins if different from creator and switch is ON
-                if (settings.adminNumber && settings.adminNumber !== creatorNum && adminAutoJoin && !gameState.players.includes(settings.adminNumber)) {
-                    gameState.players.push(settings.adminNumber)
-                    gameState.playerNames[settings.adminNumber] = nameCache[settings.adminNumber] || 'Admin'
-                    gameState.playerJids[settings.adminNumber]  = settings.adminJid || `${settings.adminNumber}@s.whatsapp.net`
-                }
-                const autoJoinMentions = gameState.players.map(num => gameState.playerJids[num] || jidOf(num))
-
-                // FIX BUG-07: use nameTag for auto-join display
-                const autoJoinText = gameState.players.length > 0
-                    ? gameState.players.map((num, i) => `${i + 1}. ${nameTag(num, nameCache, settings)} — Auto-joined 👑`).join('\n')
-                    : '[No players yet — be first! 🎯]'
-
-                // FIX: read effective difficulty via resolveSetting() so the
-                // lobby badge reflects a creator override, not just the raw
-                // admin-layer setting.
-                const difficulty = resolveSetting('difficulty', settings, 'easy')
-                await sock.sendMessage(from, {
-                    text:
-                        `🎮 *Word Riddle Game is Starting!*\n\n` +
-                        `🎯 Mode: ${difficultyBadge(difficulty)}\n\n` +
-                        `You have *60 seconds* to join! ⏱️\n\n` +
-                        `👥 *Current Lobby:*\n${autoJoinText}\n\n` +
-                        `*Commands:*\n` +
-                        `*!wrg join* — Enter the lobby\n` +
-                        `*!wrg help* — See all commands\n\n` +
-                        `_Type *!wrg join* now before time runs out!_ 🔥`,
-                    mentions: autoJoinMentions
-                })
-
-                activeGameChatRef.value = from
-                persistGames()
-                startLobbyCountdown(from, buildCtx(sock))
-                continue
-            }
-
-            // ── wrg join / wrg start / wrg help ─────────────
-            if (body.startsWith(settings.prefix) && !body.startsWith(settings.adminPrefix)) {
-                const parts   = body.split(' ')
-                const subCmd  = parts[1]
-                // FIX BUG-03: 2-arg call
-                const gameState = getGameState(from, games)
-
-                if (subCmd === 'join') {
-                    if (!gameState.lobbyActive) {
-                        await sock.sendMessage(from, {
-                            text: `⚠️ No active lobby to join! Type *!wrg start* to open one. 🎮`
-                        })
-                        continue
-                    }
-                    if (!gameState.players.includes(senderNumber)) {
-                        gameState.players.push(senderNumber)
-                        gameState.playerNames[senderNumber] = senderName
-                        gameState.playerJids[senderNumber]  = senderJid
-
-                        const lobbyMentions = gameState.players.map(num => resolveJid(num, gameState.playerJids))
-                        const lobbyText     = gameState.players
-                            .map((num, i) => `${i + 1}. ${nameTag(num, gameState.playerNames, settings)}`)
-                            .join('\n')
-
-                        // FIX BUG-06: use nameTag for join message
-                        await sock.sendMessage(from, {
-                            text:
-                                `✅ *${nameTag(senderNumber, nameCache, settings)} joined the lobby!* 🎉\n\n` +
-                                `👥 *Current Lobby:*\n${lobbyText}\n\n` +
-                                `_Type *!wrg join* to hop in!_ ⏱️`,
-                            mentions: [...new Set([resolveJid(senderNumber, gameState.playerJids), ...lobbyMentions])]
-                        })
-                        persistGames()
-                    } else {
-                        await sock.sendMessage(from, {
-                            text: `⚠️ You're already in the lobby! Sit tight — the game is starting soon. 🕐`
-                        })
-                    }
-                    continue
-                }
-
-                if (subCmd === 'start') {
-                    if (!gameState.lobbyActive) {
-                        await sock.sendMessage(from, {
-                            text: `⚠️ No active lobby! Type *!wrg start* to open one. 🎮`
-                        })
-                        continue
-                    }
-                    if (gameState.players.includes(senderNumber) || isAdmin) {
-                        await startActualGame(from, buildCtx(sock))
-                    }
-                    continue
-                }
-
-                if (!subCmd || subCmd === 'help') {
-                    await sock.sendMessage(from, {
-                        text:
-                            `🎮 *Welcome to Word Riddle Game (WRG)!*\n\n` +
-                            `*How to play:*\n` +
-                            `1️⃣ Type *!wrg start* to open a game lobby\n` +
-                            `2️⃣ Type *!wrg join* to enter the lobby\n` +
-                            `3️⃣ Once the timer hits zero, the game begins automatically!\n` +
-                            `4️⃣ On your turn, type a *single letter* to guess it, or the *full word* to win instantly ⚡\n` +
-                            `5️⃣ Miss *3 turns in a row* and you're disqualified 🚫\n` +
-                            `6️⃣ Last player standing wins! 🏆\n\n` +
-                            `_Created with ❤️ by Sky Graphics_ 🎨`
-                    })
-                    continue
-                }
-            }
-
-            // ── Active game play ────────────────────────────
-            // FIX BUG-03: 2-arg call
-            const gameState = getGameState(from, games)
-            if (gameState.active && !gameState.paused) {
-                const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
-                const isPlayerTurn        = senderNumber === currentPlayerNumber
-                const isAdminBypass       = isAdmin && !gameState.players.includes(senderNumber)
-
-                if (isPlayerTurn || isAdminBypass) {
-                    gameState.skipStreaks[currentPlayerNumber] = 0
-
-                    if (body.length === 1) {
-                        let foundIndex = -1
-                        for (let i = 0; i < gameState.targetWord.length; i++) {
-                            if (gameState.targetWord[i] === body && gameState.hiddenWord[i] === '_') {
-                                foundIndex = i
-                                break
-                            }
-                        }
-
-                        if (gameState.turnTimer) clearInterval(gameState.turnTimer)
-
-                        if (foundIndex !== -1) {
-                            gameState.hiddenWord[foundIndex] = body
-
-                            if (!gameState.hiddenWord.includes('_')) {
-                                // Victory!
-                                gameState.active        = false
-                                activeGameChatRef.value = null
-                                await sock.sendMessage(from, {
-                                    text: `🎉 *VICTORY!* The word was *${gameState.targetWord.toUpperCase()}*! Well done! 🏆`
-                                })
-                                // FIX BUG-08: pass nameTag lambda so match report shows role badges
-                                await matchSummary.sendMatchReport(
-                                    sock, from, gameState,
-                                    { type: 'winner_letter', winnerNumber: senderNumber },
-                                    (n) => nameTag(n, nameCache, settings)
-                                )
-                                gameState.players = []
-                                persistGames()
-                            } else {
-                                const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
-                                gameState.currentTurnIndex = nextTurnIndex
-
-                                // FIX BUG-04: use nameTag not tag()
-                                const feedback =
-                                    `✅ *Correct!*\n` +
-                                    `${nameTag(senderNumber, nameCache, settings)} guessed *${body.toUpperCase()}* and revealed the first occurrence! 🟢`
-                                await sendGameBoard(from, feedback, [resolveJid(senderNumber, gameState.playerJids)], buildCtx(sock))
-                            }
-                        } else {
-                            gameState.attempts[currentPlayerNumber] = (gameState.attempts[currentPlayerNumber] || 0) + 1
-                            // Use this round's snapshotted attempt budget, not the
-                            // live settings value — a /set maxtries change mid-round
-                            // must not retroactively change an in-progress round's math.
-                            const roundMaxTries = gameState.roundMaxTries || settings.maxTries
-
-                            // FIX BUG-04: use nameTag not tag()
-                            const feedback =
-                                `❌ *Wrong guess!*\n` +
-                                `${nameTag(senderNumber, nameCache, settings)} guessed *${body.toUpperCase()}* — not in the word. 🔴\n` +
-                                `_(${gameState.attempts[currentPlayerNumber]}/${roundMaxTries} wrong guesses for this player)_`
-
-                            if (gameState.attempts[currentPlayerNumber] >= roundMaxTries) {
-                                // FIX BUG-21: recordDisqualification now cleans up playerJids + attempts internally
-                                matchSummary.recordDisqualification(gameState, currentPlayerNumber, matchSummary.DQ_REASONS.ATTEMPTS_EXHAUSTED)
-
-                                const removedIndex = gameState.currentTurnIndex
-
-                                const dqFeedback =
-                                    `${feedback}\n\n` +
-                                    `🚫 *Disqualified!*\n` +
-                                    `${nameTag(currentPlayerNumber, nameCache, settings)} has used all *${roundMaxTries}* wrong guesses and has been eliminated. 💀`
-
-                                const lastStanding = matchSummary.checkLastPlayerStanding(gameState)
-                                if (lastStanding) {
-                                    gameState.active        = false
-                                    activeGameChatRef.value = null
-                                    await sock.sendMessage(from, {
-                                        text:
-                                            `${dqFeedback}\n\n` +
-                                            `🏆 *LAST PLAYER STANDING!*\n` +
-                                            `The word was *${gameState.targetWord.toUpperCase()}*. 🎉`
-                                    })
-                                    // FIX BUG-08
-                                    await matchSummary.sendMatchReport(
-                                        sock, from, gameState,
-                                        { type: 'last_standing', winnerNumber: lastStanding },
-                                        (n) => nameTag(n, nameCache, settings)
-                                    )
-                                    gameState.players = []
-                                    persistGames()
-                                } else if (gameState.players.length === 0) {
-                                    gameState.active        = false
-                                    activeGameChatRef.value = null
-                                    await sock.sendMessage(from, {
-                                        text:
-                                            `${dqFeedback}\n\n` +
-                                            `💀 *GAME OVER!* No players remain.\n` +
-                                            `The word was *${gameState.targetWord.toUpperCase()}*.`
-                                    })
-                                    // FIX BUG-08
-                                    await matchSummary.sendMatchReport(
-                                        sock, from, gameState,
-                                        { type: 'no_winner' },
-                                        (n) => nameTag(n, nameCache, settings)
-                                    )
-                                    persistGames()
-                                } else {
-                                    gameState.currentTurnIndex = removedIndex % gameState.players.length
-                                    await sendGameBoard(from, dqFeedback, [], buildCtx(sock))
-                                }
-                            } else {
-                                const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
-                                gameState.currentTurnIndex = nextTurnIndex
-                                await sendGameBoard(from, feedback, [], buildCtx(sock))
-                            }
-                        }
-                    } else if (body === gameState.targetWord) {
-                        // Full word guess = instant win
-                        if (gameState.turnTimer) clearInterval(gameState.turnTimer)
-                        gameState.active        = false
-                        activeGameChatRef.value = null
-                        await sock.sendMessage(from, {
-                            // FIX BUG-04: use nameTag not tag()
-                            text: `⚡ *INSTANT WIN!* ${nameTag(senderNumber, nameCache, settings)} guessed the full word *${gameState.targetWord.toUpperCase()}*! Incredible! 🎉🏆`
-                        })
-                        // FIX BUG-08
-                        await matchSummary.sendMatchReport(
-                            sock, from, gameState,
-                            { type: 'winner_instant', winnerNumber: senderNumber },
-                            (n) => nameTag(n, nameCache, settings)
-                        )
-                        gameState.players = []
-                        persistGames()
-                    }
-                }
-            }
+            await handler(msgCtx)
         }
     })
 }

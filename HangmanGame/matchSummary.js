@@ -1,20 +1,22 @@
-// matchSummary.js — WRG Bot · Sky Graphics
+// HangmanGame/matchSummary.js — HMG Bot · Sky Graphics
 //
 // Standalone match-summary / disqualification module.
 // Pure bookkeeping + message formatting — never owns game state.
 
+const config = require('./config')
+
 const DQ_REASONS = {
-    SKIPPED_3:      'Skipped 3 turns in a row',
-    ADMIN_REMOVED:  'Removed by admin',
-    LEFT_GROUP:     'Left the group',
-    MANUAL_LEAVE:   'Left the game voluntarily',
+    SKIPPED_3:          'Skipped 3 turns in a row',
+    ADMIN_REMOVED:      'Removed by admin',
+    LEFT_GROUP:         'Left the group',
+    MANUAL_LEAVE:       'Left the game voluntarily',
     ATTEMPTS_EXHAUSTED: 'Used all wrong guesses'
 }
 
 /**
  * Record a player disqualification into gameState.disqualified
- * and remove them from gameState.players.
- * FIX BUG-21: also cleans up playerJids and attempts so no orphaned keys remain.
+ * and remove them from gameState.players. Cleans up playerJids
+ * and attempts so no orphaned keys remain.
  */
 function recordDisqualification(gameState, number, reason = DQ_REASONS.SKIPPED_3) {
     if (!gameState.disqualified) gameState.disqualified = []
@@ -32,7 +34,6 @@ function recordDisqualification(gameState, number, reason = DQ_REASONS.SKIPPED_3
     gameState.players.splice(index, 1)
     delete gameState.playerNames[number]
     delete gameState.skipStreaks[number]
-    // FIX BUG-21: consistently clean up playerJids and attempts here
     delete gameState.playerJids?.[number]
     delete gameState.attempts?.[number]
 
@@ -51,12 +52,7 @@ function checkLastPlayerStanding(gameState) {
 
 /**
  * Builds and sends the full match report.
- *
- * @param {object} sock
- * @param {string} chatId
- * @param {object} gameState
- * @param {object} outcome  — { type, winnerNumber? }
- * @param {function} tag    — tag(number) → display string with role badge
+ * @param {function} tag — tag(number) → display string with role badge
  */
 async function sendMatchReport(sock, chatId, gameState, outcome, tag) {
     const disqualified = gameState.disqualified || []
@@ -73,41 +69,37 @@ async function sendMatchReport(sock, chatId, gameState, outcome, tag) {
         reason:       entry.reason
     }))
 
-    const allParticipants    = [...survivorEntries, ...dqEntries]
-    const totalJoined        = allParticipants.length
-    const totalDisqualified  = dqEntries.length
+    const allParticipants   = [...survivorEntries, ...dqEntries]
+    const totalJoined       = allParticipants.length
+    const totalDisqualified = dqEntries.length
 
-    let headerLine   = ''
-    let winnerLine   = ''
-    let winnerNumber = null
+    let headerLine = '', winnerLine = '', winnerNumber = null
 
     switch (outcome.type) {
         case 'winner_letter':
             winnerNumber = outcome.winnerNumber
-            headerLine   = '🏆 *WRG MATCH COMPLETE*'
+            headerLine   = `🏆 *${config.GAME_ACRONYM} MATCH COMPLETE*`
             winnerLine   = `🎉 *Winner*\n✅ ${tag(winnerNumber)}`
             break
         case 'winner_instant':
             winnerNumber = outcome.winnerNumber
-            headerLine   = '🏆 *WRG MATCH COMPLETE*'
+            headerLine   = `🏆 *${config.GAME_ACRONYM} MATCH COMPLETE*`
             winnerLine   = `🎉 *Winner (Instant Word Guess)*\n✅ ${tag(winnerNumber)}`
             break
         case 'last_standing':
             winnerNumber = outcome.winnerNumber
-            headerLine   = '🏆 *WRG MATCH COMPLETE*'
+            headerLine   = `🏆 *${config.GAME_ACRONYM} MATCH COMPLETE*`
             winnerLine   = `🎉 *Winner (Last Player Standing)*\n✅ ${tag(winnerNumber)}\n_All other players were disqualified._`
             break
         case 'no_winner':
         default:
-            headerLine = '🛑 *WRG MATCH COMPLETE*'
+            headerLine = `🛑 *${config.GAME_ACRONYM} MATCH COMPLETE*`
             winnerLine = `😶 *No Winner*\nThe round ended with no surviving player.`
             break
     }
 
     const participantLines = []
-    if (winnerNumber) {
-        participantLines.push(`✅ ${tag(winnerNumber)} (Winner)`)
-    }
+    if (winnerNumber) participantLines.push(`✅ ${tag(winnerNumber)} (Winner)`)
     for (const entry of allParticipants) {
         if (entry.number === winnerNumber) continue
         const mark   = entry.disqualified ? '❌' : '✅'
@@ -127,28 +119,17 @@ async function sendMatchReport(sock, chatId, gameState, outcome, tag) {
         `Disqualified: ${totalDisqualified}\n` +
         `Winner: ${winnerNumber ? 1 : 0}`
 
-    // Use stored playerJids where available for accurate mention JIDs
     const mentionSet = new Set()
     for (const p of allParticipants) {
-        const jid = (gameState.playerJids && gameState.playerJids[p.number])
-            || `${p.number}@s.whatsapp.net`
+        const jid = (gameState.playerJids && gameState.playerJids[p.number]) || `${p.number}@s.whatsapp.net`
         mentionSet.add(jid)
     }
     if (winnerNumber) {
-        const winnerJid = (gameState.playerJids && gameState.playerJids[winnerNumber])
-            || `${winnerNumber}@s.whatsapp.net`
+        const winnerJid = (gameState.playerJids && gameState.playerJids[winnerNumber]) || `${winnerNumber}@s.whatsapp.net`
         mentionSet.add(winnerJid)
     }
 
-    await sock.sendMessage(chatId, {
-        text:     report,
-        mentions: [...mentionSet]
-    })
+    await sock.sendMessage(chatId, { text: report, mentions: [...mentionSet] })
 }
 
-module.exports = {
-    DQ_REASONS,
-    recordDisqualification,
-    checkLastPlayerStanding,
-    sendMatchReport
-}
+module.exports = { DQ_REASONS, recordDisqualification, checkLastPlayerStanding, sendMatchReport }

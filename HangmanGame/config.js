@@ -1,0 +1,29 @@
+// ============================================================
+//  HangmanGame/config.js — HMG Bot · Sky Graphics
+//  Single source of truth for this game's identity + prefixes.
+//  Change these once here — every other file imports from this
+//  module instead of hardcoding strings.
+// ============================================================
+
+module.exports = {
+    GAME_KEY:      'hangman',
+    GAME_NAME:     'HangMan Game',
+    GAME_ACRONYM:  'HMG',
+
+    // Public command prefix (e.g. "!hmg join")
+    PREFIX:        '!hmg',
+    // Admin command prefix — note trailing space, matches original convention
+    ADMIN_PREFIX:  '/hmg ',
+
+    // ── Adaptive word-length difficulty ─────────────────────
+    MIN_WORD_LENGTH:   4,
+    MAX_WORD_LENGTH:   12,
+    START_WORD_LENGTH: 5,
+    LENGTH_STEP:       1,   // letters to drift up/down per round
+
+    // ── Timers ───────────────────────────────────────────────
+    LOBBY_SECONDS:        60,
+    TURN_SECONDS:         30,
+    COOLDOWN_SECONDS:     120,  // 2-minute post-round discussion window
+    COOLDOWN_WARNING_AT:  30    // send "starting soon" ping at T-30s
+}

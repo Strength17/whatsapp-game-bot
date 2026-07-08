@@ -1,0 +1,306 @@
+// ============================================================
+//  HangmanGame/publicCommands.js — HMG Bot · Sky Graphics
+//  Handles all PUBLIC (non-admin) message flow for this game:
+//    !hmg            — ping + intro
+//    !hmg start      — open a lobby
+//    !hmg join       — join the open lobby
+//    !hmg help       — how-to-play card
+//    live letter/word guesses while a round is active
+//
+//  Admin "/" commands live in adminCommands.js. Pure game-state
+//  mechanics (timers, boards, word picking) live in gameEngine.js.
+//  This file is the glue between an inbound WhatsApp message and
+//  those two.
+// ============================================================
+
+const matchSummary = require('./matchSummary')
+const { nameTag, resolveSetting } = require('../permissions')
+const config = require('./config')
+const engine = require('./gameEngine')
+
+function jidOf(number) {
+    if (!number) return ''
+    return number.includes('@') ? number : `${number}@s.whatsapp.net`
+}
+
+function resolveJid(number, playerJids) {
+    if (!number) return ''
+    if (number.includes('@')) return number
+    return (playerJids && playerJids[number]) || `${number}@s.whatsapp.net`
+}
+
+/**
+ * @param {object} msgCtx — everything index.js already knows about this message:
+ *   { sock, games, settings, words, activeGameChatRef, persistGames, nameCache,
+ *     sendSafeMessage, buildCtx, from, body, rawBody, senderNumber, senderJid,
+ *     senderName, isAdmin }
+ * @returns {boolean} true if this message was handled by the Hangman game.
+ */
+async function handlePublicMessage(msgCtx) {
+    const {
+        sock, games, settings, activeGameChatRef, persistGames, nameCache,
+        sendSafeMessage, buildCtx, from, body, rawBody, senderNumber, senderJid,
+        senderName, isAdmin
+    } = msgCtx
+
+    const ctx = buildCtx()
+
+    // ── !hmg (alone) = ping + intro card ────────────────────
+    if (body === config.PREFIX) {
+        const pingStart = Date.now()
+        await sock.sendMessage(from, { text: '🏓 Ping!' })
+        await sock.sendMessage(from, { text: '🏓 Pong!' })
+        const pingMs = Date.now() - pingStart
+        await sock.sendMessage(from, { text: `⚡ *${config.GAME_ACRONYM} Bot* | Response time: *${pingMs}ms*` })
+
+        await sock.sendMessage(from, {
+            text:
+                `━━━━━━━━━━━━━━━━━━━━━━\n` +
+                `🎮 *${config.GAME_NAME} (${config.GAME_ACRONYM})*\n` +
+                `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+                `Hey there! 👋 I'm the *${config.GAME_ACRONYM} Bot* — a live multiplayer word-guessing game built for WhatsApp groups.\n\n` +
+                `Players take turns guessing letters to reveal a hidden word. Miss 3 turns in a row and you're out! The last one standing wins. 🏆\n\n` +
+                `📏 *No fixed difficulty levels* — the word length quietly adapts round to round based on how the group is doing.\n\n` +
+                `_Created with ❤️ by_ *_Sky Graphics_* 🎨\n\n` +
+                `━━━━━━━━━━━━━━━━━━━━━━\n` +
+                `*🎮 How to Play:*\n\n` +
+                `1️⃣ Type *${config.PREFIX} start* to open a lobby\n` +
+                `2️⃣ Type *${config.PREFIX} join* to enter it\n` +
+                `3️⃣ Guess a letter, or the full word for an instant win ⚡\n` +
+                `4️⃣ Miss 3 turns in a row and you're disqualified 🚫`
+        })
+        return true
+    }
+
+    // ── !hmg start = open lobby ──────────────────────────────
+    if (rawBody.toLowerCase() === `${config.PREFIX} start`) {
+        const effectivePublicCanStart = resolveSetting('publicCanStart', settings, false)
+        if (!isAdmin && !effectivePublicCanStart) {
+            await sock.sendMessage(from, {
+                text: `🔒 *Game Locked*\nThe admin hasn't enabled public game starts. Only the admin can open a lobby right now.`
+            })
+            return true
+        }
+
+        if (activeGameChatRef.value) {
+            if (activeGameChatRef.value === from) {
+                await sock.sendMessage(from, { text: `⚠️ A game or lobby is *already active in this chat!* ⏳` })
+            } else {
+                await sock.sendMessage(from, {
+                    text: `⚠️ A game is currently running in another chat. It must end before a new one can start.`
+                })
+                const adminTarget = settings.adminJid || settings.adminNumber
+                if (adminTarget) {
+                    try {
+                        await sendSafeMessage(sock, adminTarget, {
+                            text:
+                                `⚠️ *Duplicate Game Attempt*\n\n` +
+                                `Someone tried to start a game in *${from}* while a game is already active in *${activeGameChatRef.value}*.\n\n` +
+                                `Use */hmg end* to stop the current game if needed. 🎮`
+                        })
+                    } catch (_) {}
+                }
+            }
+            return true
+        }
+
+        await engine.openFreshLobby(from, ctx)
+        return true
+    }
+
+    // ── !hmg join / !hmg help ────────────────────────────────
+    if (body.startsWith(config.PREFIX)) {
+        const parts  = body.split(' ')
+        const subCmd = parts[1]
+        const gameState = engine.getGameState(from, games)
+
+        if (subCmd === 'join') {
+            if (!gameState.lobbyActive) {
+                await sock.sendMessage(from, { text: `⚠️ No active lobby to join! Type *${config.PREFIX} start* to open one. 🎮` })
+                return true
+            }
+            if (!gameState.players.includes(senderNumber)) {
+                gameState.players.push(senderNumber)
+                gameState.playerNames[senderNumber] = senderName
+                gameState.playerJids[senderNumber]  = senderJid
+
+                const lobbyMentions = gameState.players.map(num => resolveJid(num, gameState.playerJids))
+                const lobbyText = gameState.players
+                    .map((num, i) => `${i + 1}. ${nameTag(num, gameState.playerNames, settings)}`)
+                    .join('\n')
+
+                await sock.sendMessage(from, {
+                    text:
+                        `✅ *${nameTag(senderNumber, nameCache, settings)} joined the lobby!* 🎉\n\n` +
+                        `👥 *Current Lobby:*\n${lobbyText}\n\n` +
+                        `_Type *${config.PREFIX} join* to hop in!_ ⏱️`,
+                    mentions: [...new Set([resolveJid(senderNumber, gameState.playerJids), ...lobbyMentions])]
+                })
+                persistGames()
+            } else {
+                await sock.sendMessage(from, { text: `⚠️ You're already in the lobby! Sit tight — the game is starting soon. 🕐` })
+            }
+            return true
+        }
+
+        if (subCmd === 'start') {
+            if (!gameState.lobbyActive) {
+                await sock.sendMessage(from, { text: `⚠️ No active lobby! Type *${config.PREFIX} start* to open one. 🎮` })
+                return true
+            }
+            if (gameState.players.includes(senderNumber) || isAdmin) {
+                await engine.startActualGame(from, ctx)
+            }
+            return true
+        }
+
+        if (!subCmd || subCmd === 'help') {
+            await sock.sendMessage(from, {
+                text:
+                    `🎮 *Welcome to ${config.GAME_NAME} (${config.GAME_ACRONYM})!*\n\n` +
+                    `*How to play:*\n` +
+                    `1️⃣ Type *${config.PREFIX} start* to open a game lobby\n` +
+                    `2️⃣ Type *${config.PREFIX} join* to enter the lobby\n` +
+                    `3️⃣ Once the timer hits zero, the game begins automatically!\n` +
+                    `4️⃣ On your turn, type a *single letter* to guess it, or the *full word* to win instantly ⚡\n` +
+                    `5️⃣ Miss *3 turns in a row* and you're disqualified 🚫\n` +
+                    `6️⃣ Last player standing wins! 🏆\n` +
+                    `📏 Word length adapts automatically each round — no fixed difficulty setting.\n\n` +
+                    `_Created with ❤️ by Sky Graphics_ 🎨`
+            })
+            return true
+        }
+
+        // Unrecognised !hmg subcommand — still "handled" (silently ignored)
+        return true
+    }
+
+    // ── Active game play (letter / word guesses) ─────────────
+    const gameState = engine.getGameState(from, games)
+    if (!gameState.active || gameState.paused) return false
+
+    const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
+    const isPlayerTurn        = senderNumber === currentPlayerNumber
+    const isAdminBypass       = isAdmin && !gameState.players.includes(senderNumber)
+
+    if (!isPlayerTurn && !isAdminBypass) return false
+    if (body.length !== 1 && body !== gameState.targetWord) return false
+
+    gameState.skipStreaks[currentPlayerNumber] = 0
+
+    // ── Full word guess = instant win ─────────────────────
+    if (body === gameState.targetWord && body.length !== 1) {
+        if (gameState.turnTimer) clearInterval(gameState.turnTimer)
+        gameState.active = false
+        await sock.sendMessage(from, {
+            text: `⚡ *INSTANT WIN!* ${nameTag(senderNumber, nameCache, settings)} guessed the full word *${gameState.targetWord.toUpperCase()}*! Incredible! 🎉🏆`
+        })
+        const outcome = { type: 'winner_instant', winnerNumber: senderNumber }
+        await matchSummary.sendMatchReport(sock, from, gameState, outcome, (n) => nameTag(n, nameCache, settings))
+        engine.adjustNextWordLength(gameState, outcome)
+        gameState.players = []
+        persistGames()
+        await engine.startCooldown(from, ctx)
+        return true
+    }
+
+    if (body.length !== 1) return false // shouldn't reach here, safety net
+
+    // ── Single-letter guess ────────────────────────────────
+    let foundIndex = -1
+    for (let i = 0; i < gameState.targetWord.length; i++) {
+        if (gameState.targetWord[i] === body && gameState.hiddenWord[i] === '_') {
+            foundIndex = i
+            break
+        }
+    }
+
+    if (gameState.turnTimer) clearInterval(gameState.turnTimer)
+
+    if (foundIndex !== -1) {
+        gameState.hiddenWord[foundIndex] = body
+
+        if (!gameState.hiddenWord.includes('_')) {
+            gameState.active = false
+            await sock.sendMessage(from, {
+                text: `🎉 *VICTORY!* The word was *${gameState.targetWord.toUpperCase()}*! Well done! 🏆`
+            })
+            const outcome = { type: 'winner_letter', winnerNumber: senderNumber }
+            await matchSummary.sendMatchReport(sock, from, gameState, outcome, (n) => nameTag(n, nameCache, settings))
+            engine.adjustNextWordLength(gameState, outcome)
+            gameState.players = []
+            persistGames()
+            await engine.startCooldown(from, ctx)
+        } else {
+            const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
+            gameState.currentTurnIndex = nextTurnIndex
+            const feedback =
+                `✅ *Correct!*\n` +
+                `${nameTag(senderNumber, nameCache, settings)} guessed *${body.toUpperCase()}* and revealed the first occurrence! 🟢`
+            await engine.sendGameBoard(from, feedback, [resolveJid(senderNumber, gameState.playerJids)], ctx)
+        }
+        return true
+    }
+
+    // ── Wrong guess ─────────────────────────────────────────
+    gameState.attempts[currentPlayerNumber] = (gameState.attempts[currentPlayerNumber] || 0) + 1
+    const roundMaxTries = gameState.roundMaxTries || settings.maxTries
+    const wrongCount = gameState.attempts[currentPlayerNumber]
+
+    // Per-player DM stick figure, fired the moment THIS player misses —
+    // naturally staggered across real gameplay, never a bulk broadcast.
+    try {
+        const dmJid = resolveJid(senderNumber, gameState.playerJids)
+        await sendSafeMessage(sock, dmJid, { text: engine.buildStickFigureDM(wrongCount, roundMaxTries) })
+    } catch (_) {}
+
+    const feedback =
+        `❌ *Wrong guess!*\n` +
+        `${nameTag(senderNumber, nameCache, settings)} guessed *${body.toUpperCase()}* — not in the word. 🔴\n` +
+        `_(${wrongCount}/${roundMaxTries} wrong guesses for this player)_`
+
+    if (wrongCount >= roundMaxTries) {
+        matchSummary.recordDisqualification(gameState, currentPlayerNumber, matchSummary.DQ_REASONS.ATTEMPTS_EXHAUSTED)
+        const removedIndex = gameState.currentTurnIndex
+
+        const dqFeedback =
+            `${feedback}\n\n` +
+            `🚫 *Disqualified!*\n` +
+            `${nameTag(currentPlayerNumber, nameCache, settings)} has used all *${roundMaxTries}* wrong guesses and has been eliminated. 💀`
+
+        const lastStanding = matchSummary.checkLastPlayerStanding(gameState)
+        if (lastStanding) {
+            gameState.active = false
+            await sock.sendMessage(from, {
+                text: `${dqFeedback}\n\n🏆 *LAST PLAYER STANDING!*\nThe word was *${gameState.targetWord.toUpperCase()}*. 🎉`
+            })
+            const outcome = { type: 'last_standing', winnerNumber: lastStanding }
+            await matchSummary.sendMatchReport(sock, from, gameState, outcome, (n) => nameTag(n, nameCache, settings))
+            engine.adjustNextWordLength(gameState, outcome)
+            gameState.players = []
+            persistGames()
+            await engine.startCooldown(from, ctx)
+        } else if (gameState.players.length === 0) {
+            gameState.active = false
+            await sock.sendMessage(from, {
+                text: `${dqFeedback}\n\n💀 *GAME OVER!* No players remain.\nThe word was *${gameState.targetWord.toUpperCase()}*.`
+            })
+            const outcome = { type: 'no_winner' }
+            await matchSummary.sendMatchReport(sock, from, gameState, outcome, (n) => nameTag(n, nameCache, settings))
+            engine.adjustNextWordLength(gameState, outcome)
+            persistGames()
+            await engine.startCooldown(from, ctx)
+        } else {
+            gameState.currentTurnIndex = removedIndex % gameState.players.length
+            await engine.sendGameBoard(from, dqFeedback, [], ctx)
+        }
+    } else {
+        const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
+        gameState.currentTurnIndex = nextTurnIndex
+        await engine.sendGameBoard(from, feedback, [], ctx)
+    }
+
+    return true
+}
+
+module.exports = { handlePublicMessage }

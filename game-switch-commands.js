@@ -11,6 +11,14 @@
 //    /game status                 — show what's active + what's available
 //    /game roletags on|off        — bot-wide (Creator)/(Admin) name tag toggle
 //
+//  "setgame" also attempts a clean hand-off (ARCHITECTURE.md §10): if the
+//  previous game has a live session in the shared activeGameChatRef chat
+//  and exports gameEngine.forceStopActiveSession(chatId, ctx), it's
+//  called and cleanly stopped before the switch. If a game doesn't
+//  export that function, the switch still happens — the confirmation
+//  message just says so honestly instead of leaving orphaned timers
+//  running silently.
+//
 //  index.js calls handleGameSwitchCommands(ctx) directly when a message
 //  starts with "/game". Returns true if handled (and replied to).
 // ============================================================
@@ -20,7 +28,7 @@ const registry = require('./games-registry')
 async function handleGameSwitchCommands(ctx) {
     const {
         cmd, senderIsCreator, sock, sendSafeMessage, replyTo,
-        settings, saveSettings
+        settings, saveSettings, activeGameChatRef, games, persistGames
     } = ctx
     // ctx.senderIsAdmin is read directly (not destructured above) only by
     // the status branch below — kept optional so existing callers that
@@ -44,12 +52,40 @@ async function handleGameSwitchCommands(ctx) {
             return true
         }
 
+        // ── Clean hand-off — ARCHITECTURE.md §10 (optional contract) ──
+        // If a previous game has a live session in the one shared
+        // activeGameChatRef chat, try to stop it cleanly before flipping
+        // settings.activeGame. Nothing here is mandatory on any game's
+        // part: if forceStopActiveSession isn't exported, we say so
+        // honestly instead of silently leaving orphaned timers running.
+        const previousGame = registry.getActiveGame(settings)
+        let stoppedNote = ''
+
+        if (previousGame && activeGameChatRef && activeGameChatRef.value &&
+            previousGame.config.GAME_KEY !== game.config.GAME_KEY) {
+
+            if (typeof previousGame.gameEngine.forceStopActiveSession === 'function') {
+                const stopped = await previousGame.gameEngine.forceStopActiveSession(
+                    activeGameChatRef.value, { games, persistGames, sock, settings }
+                )
+                if (stopped) {
+                    stoppedNote = `\n🛑 Stopped: *${previousGame.config.GAME_NAME}* was active in this chat — ended cleanly.\n`
+                    activeGameChatRef.value = null
+                    if (typeof persistGames === 'function') persistGames()
+                }
+            } else {
+                stoppedNote =
+                    `\n⚠️ *${previousGame.config.GAME_NAME}* may still have an active session in this chat — ` +
+                    `it doesn't support clean hand-off yet. Consider \`${previousGame.config.ADMIN_PREFIX}stop\` first.\n`
+            }
+        }
+
         settings.activeGame = game.config.GAME_KEY
         saveSettings()
 
         await sendSafeMessage(sock, replyTo, {
             text:
-                `✅ *Active game switched.*\n\n` +
+                `✅ *Active game switched.*${stoppedNote}\n` +
                 `🎮 Now running: *${game.config.GAME_NAME} (${game.config.GAME_ACRONYM})*\n` +
                 `Public prefix: \`${game.config.PREFIX}\`\n` +
                 `Admin prefix: \`${game.config.ADMIN_PREFIX.trim()}\`\n\n` +

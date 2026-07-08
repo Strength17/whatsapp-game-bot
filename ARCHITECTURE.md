@@ -281,7 +281,74 @@ actually invokes each game's real message handler as an ADMIN sending
 the bare prefix and fails the build if the game's state goes active as a
 result — so this can never regress silently again.
 
-## 10. Before every deploy
+## 10. Optional: clean hand-off between games (`forceStopActiveSession`)
+
+**The gap this closes:** `activeGameChatRef` — the pointer marking "this
+chat has a live game session" — is one shared object for the entire bot,
+not one per game (see §4's same rule for `games`/`settings`). Before this
+section existed, `/game setgame [key]` only ever did this:
+
+```js
+settings.activeGame = game.config.GAME_KEY
+saveSettings()
+// ...confirmation message...
+```
+
+It never checked whether the *previous* game had a session running in
+that chat, and never stopped one. Concretely: if Hangman has a round live
+when the creator runs `/game setgame wordladder`, Hangman's `gameState.
+active` stays `true` and its timers (turn countdown, disqualification,
+cooldown) keep firing on their own schedule — but every new message in
+that chat now routes to Word Ladder instead, so Hangman can never receive
+another guess to end normally. Its orphaned timers keep posting into the
+group (timeouts, "you're disqualified," etc.) at the same time Word
+Ladder is posting its own round messages — genuinely interleaved,
+confusing output in one chat.
+
+**The fix — entirely optional per game, nothing is mandatory:**
+
+```js
+// gameEngine.js — optional export
+function forceStopActiveSession(chatId, ctx) {
+    const { games, persistGames } = ctx
+    const gameState = getGameState(chatId, games)
+    const wasRunning = !!(gameState.active || gameState.lobbyActive)
+
+    // clear every timer your game uses, then reset to idle:
+    if (gameState.lobbyTimer) clearInterval(gameState.lobbyTimer)
+    if (gameState.turnTimer)  clearInterval(gameState.turnTimer)
+    gameState.active = false
+    gameState.lobbyActive = false
+
+    if (typeof persistGames === 'function') persistGames()
+    return wasRunning   // true if there was something worth reporting
+}
+module.exports = { /* ...your other exports..., */ forceStopActiveSession }
+```
+
+`game-switch-commands.js`'s `setgame` handler checks for this export
+generically, the exact same pattern already used for `getGameState` /
+`handleAdminCommand`:
+
+- **Exported and a session was running** → it's called, the session is
+  cleanly stopped, `activeGameChatRef.value` is cleared, and the switch
+  confirmation says exactly what was stopped.
+- **Exported but nothing was running** → silently a no-op, switch
+  proceeds normally.
+- **Not exported at all** → the switch still happens (nobody is ever
+  blocked from switching), but the confirmation message honestly warns
+  that the previous game may still have a live session and suggests its
+  own `stop` command first, instead of saying nothing and leaving
+  orphaned timers running silently.
+
+Never make a game's own logic reach into another game's state to stop
+it — `forceStopActiveSession` is the only sanctioned entry point, called
+generically through the registry, never a direct file-to-file reference
+between two game folders. This preserves the same independence guarantee
+as every other rule in this document: no game ever knows another game
+exists.
+
+## 11. Before every deploy
 
 ```
 npm run verify
@@ -311,3 +378,4 @@ deploying; ⚠️ warnings won't block a deploy but are worth reading.
 | `/hmg reset` wiped every other game's saved data, not just Hangman's | It looped over the entire shared `games` object and deleted every key, and unconditionally deleted `games.json` | §4 — always scope bulk operations to your own `GAME_KEY:` prefix |
 | Typing bare `!m4th` or `!tgt` (no subcommand) either silently force-started a round with no explanation, or hit a confusing "only an admin can start" wall | `publicCommands.js` merged the "nothing typed" case into the same `if` branch as the `'start'` subcommand | §9 + `npm run verify` check 6 |
 | `WordChainGame`'s difficulty/timer/strikes settings were one future game's `writeSetting('difficulty', ...)` away from silently overwriting (or being overwritten by) another game's setting of the same name | Settings were written under bare generic keys (`'difficulty'`, `'timerSeconds'`, `'maxStrikes'`) instead of a `GAME_KEY`-prefixed key | §4 (settings sub-rule) |
+| Switching games mid-round (`/game setgame ...`) left the previous game's timers running and posting into the group at the same time as the new game, with no message explaining what (if anything) had been stopped | `setgame`'s handler only ever wrote `settings.activeGame` — it never checked or stopped a live session in the shared `activeGameChatRef` chat | §10 (`forceStopActiveSession`) |

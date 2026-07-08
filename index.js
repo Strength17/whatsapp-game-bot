@@ -505,7 +505,8 @@ async function startBot() {
 
                 const handled = await handleGameSwitchCommands({
                     cmd, senderIsCreator, senderIsAdmin: isAdmin, sock, sendSafeMessage,
-                    replyTo: senderJid, settings, saveSettings
+                    replyTo: senderJid, settings, saveSettings,
+                    activeGameChatRef, games, persistGames
                 })
 
                 if (!handled && senderIsCreator) {

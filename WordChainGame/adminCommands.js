@@ -129,7 +129,8 @@ async function handleAdminCommand(ctx) {
         const gs = getGameState(chatId, games)
         if (!gs.active) return reply(`⚠️ No active round to pause.`)
         gs.paused = true
-        if (gs.turnTimer) clearInterval(gs.turnTimer)
+        const timers = gameEngine.getTimers(chatId)
+        if (timers.turnTimer) clearInterval(timers.turnTimer)
         persistGames()
         return reply(`⏸️ *Word Chain paused* by an admin. ${gs.turnSecondsLeft}s were left on the turn clock, ${Math.floor((gs.matchSecondsLeft||0)/60)}:${String((gs.matchSecondsLeft||0)%60).padStart(2,'0')} left on the match clock — both resume from here, not reset.`)
     }
@@ -154,9 +155,7 @@ async function handleAdminCommand(ctx) {
         const wasActive = gs.active
         gs.active = false
         gs.lobbyActive = false
-        if (gs.turnTimer)  clearInterval(gs.turnTimer)
-        if (gs.lobbyTimer) clearInterval(gs.lobbyTimer)
-        if (gs.matchTimer) clearInterval(gs.matchTimer)
+        gameEngine.clearAllTimers(chatId)
 
         // Only release the global lock if IT WAS THIS CHAT holding it — an
         // admin stopping Chat A's game must never sever Chat B's live lock.

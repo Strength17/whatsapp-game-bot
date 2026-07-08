@@ -116,6 +116,52 @@ the same section.
 | `/wcg admin` self-claim lived in `adminCommands.js` | Lives in `publicCommands.js` per §5 |
 | Manual `difficulty`/`timerSeconds`/`maxStrikes`/`theme` settings | Deleted — fully automatic now, including theme rotation |
 
+## Fixed this pass: the "game goes dead right after Lobby Closed" bug
+
+**Root cause:** `gameState.lobbyTimer` / `turnTimer` / `matchTimer` were
+raw `setInterval` handles stored directly on `gameState` — the exact
+object `persistGames()` serializes to disk. A Node `Timeout` has
+internal circular references, so `JSON.stringify(games)` throws
+`"Converting circular structure to JSON"` the instant a timer exists on
+it. Because that call sits inside an `async setInterval` callback — not
+covered by `index.js`'s per-message `try/catch` — the failure was
+**silent**: the round would go dead right after the "Lobby Closed" card,
+with nothing visible to players or the admin. This matches exactly what
+was reported (game froze immediately after start; "Tea" and "Tree" got
+no response at all).
+
+**Fix:** all three timer handles now live in `timerStore`, a
+module-level `Map` keyed by chat ID, completely outside `gameState` and
+therefore outside anything `persistGames()` ever touches. Every timer
+read/write goes through `getTimers(chatId)` / `clearAllTimers(chatId)`
+now, in both `gameEngine.js` and `adminCommands.js`. `getGameState()`
+also defensively `delete`s any of the three fields if they're ever found
+on a loaded/legacy state object, so a pre-fix save file can't reintroduce
+the bug either.
+
+**Verified with a real end-to-end test**, not just a code review — the
+same fixed files, running against the real ~370k-word dictionary, with
+**real `setInterval` timers actually ticking** and **real
+`fs.writeFileSync(JSON.stringify(games))` persistence** (not a mock):
+
+1. Opened a real lobby, let the real lobby timer tick multiple times —
+   confirmed `persistGames()` never threw.
+2. Joined two players, force-closed the lobby, started the match — the
+   exact "Lobby Closed — Word Chain is ON!" card from the report.
+3. Let the real turn timer **and** match timer tick post-start — the
+   exact moment the reported game went dead.
+4. Reproduced the exact reported input: sent `"Tea"` (accepted, chain
+   grows, bot responds) then `"Tree"` (wrong starting letter — bot
+   correctly sends a strike message, **not silence**).
+5. Confirmed the full shared `games` object — including another game's
+   state living alongside it, per ARCHITECTURE.md §4 — stays 100%
+   JSON-round-trippable after every transition: join, start, word
+   accepted, word rejected, pause, resume, cross-chat end guard, real
+   admin end (with match report), and a full match-duration timeout.
+6. Re-checked the whole folder for any other raw `gs.*Timer` /
+   `gameState.*Timer` references — none remain outside the intentional
+   defensive `delete` lines.
+
 ## Known limitation (unchanged)
 
 Words ending in rare letters (like **X**) can occasionally dead-end a

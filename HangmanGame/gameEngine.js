@@ -587,6 +587,38 @@ function startCooldown(chatId, ctx) {
     }, 1000)
 }
 
+// ─── Force-stop — optional contract addition (ARCHITECTURE.md §10) ──
+// Called ONLY by game-switch-commands.js, ONLY when the creator runs
+// "/game setgame ..." while Hangman has a live session in this chat.
+// Clears every timer type Hangman uses (lobby/turn/cooldown) and
+// resets state to idle. Never sends a chat message itself — the
+// caller (game-switch-commands.js) reports what was stopped, once,
+// in its own confirmation message, so the player never sees two
+// separate "stopped"/"switched" messages for one action.
+// Returns true if something was actually running (worth reporting),
+// false if there was nothing to clean up.
+function forceStopActiveSession(chatId, ctx) {
+    const { games, persistGames } = ctx
+    const gameState = getGameState(chatId, games)
+
+    const wasRunning = !!(gameState.active || gameState.lobbyActive || gameState.cooldownActive)
+
+    if (gameState.lobbyTimer)    clearInterval(gameState.lobbyTimer)
+    if (gameState.turnTimer)     clearInterval(gameState.turnTimer)
+    if (gameState.cooldownTimer) clearInterval(gameState.cooldownTimer)
+
+    gameState.lobbyTimer     = null
+    gameState.turnTimer      = null
+    gameState.cooldownTimer  = null
+    gameState.active         = false
+    gameState.lobbyActive    = false
+    gameState.cooldownActive = false
+    gameState.paused         = false
+
+    if (typeof persistGames === 'function') persistGames()
+    return wasRunning
+}
+
 module.exports = {
     config,
     DEFAULT_WORDS,
@@ -601,5 +633,6 @@ module.exports = {
     resolveRoundMaxTries,
     pickWordForLength,
     adjustNextWordLength,
-    buildStickFigureCard
+    buildStickFigureCard,
+    forceStopActiveSession
 }

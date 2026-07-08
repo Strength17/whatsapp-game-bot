@@ -110,14 +110,18 @@ async function sendMatchReport(sock, chatId, gameState, outcome, tag) {
     const wordLine = gameState.targetWord ? gameState.targetWord.toUpperCase() : 'N/A'
 
     const report =
-        `${headerLine}\n\n` +
+        `${config.DIVIDER}\n` +
+        `${config.BOT_EMOJI} ${headerLine}\n` +
+        `${config.DIVIDER}\n\n` +
         `${winnerLine}\n\n` +
         `👥 *Participants*\n${participantLines.join('\n') || '[None]'}\n\n` +
         `🔤 *Word*\n${wordLine}\n\n` +
         `📊 *Match Statistics*\n` +
         `Players Joined: ${totalJoined}\n` +
         `Disqualified: ${totalDisqualified}\n` +
-        `Winner: ${winnerNumber ? 1 : 0}`
+        `Winner: ${winnerNumber ? 1 : 0}\n\n` +
+        `${config.DIVIDER}\n` +
+        `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
 
     const mentionSet = new Set()
     for (const p of allParticipants) {

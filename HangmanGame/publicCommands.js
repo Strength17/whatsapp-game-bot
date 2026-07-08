@@ -55,15 +55,14 @@ async function handlePublicMessage(msgCtx) {
 
         await sock.sendMessage(from, {
             text:
-                `━━━━━━━━━━━━━━━━━━━━━━\n` +
-                `🎮 *${config.GAME_NAME} (${config.GAME_ACRONYM})*\n` +
-                `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-                `Hey there! 👋 I'm the *${config.GAME_ACRONYM} Bot* — a live multiplayer word-guessing game built for WhatsApp groups.\n\n` +
-                `Players take turns guessing letters to reveal a hidden word. Miss 3 turns in a row and you're out! The last one standing wins. 🏆\n\n` +
-                `📏 *No fixed difficulty levels* — the word length quietly adapts round to round based on how the group is doing.\n\n` +
-                `_Created with ❤️ by_ *_Sky Graphics_* 🎨\n\n` +
-                `━━━━━━━━━━━━━━━━━━━━━━\n` +
-                `*🎮 How to Play:*\n\n` +
+                `${config.DIVIDER}\n` +
+                `${config.BOT_EMOJI}  *${config.GAME_NAME} (${config.GAME_ACRONYM}) Bot*\n` +
+                `${config.DIVIDER}\n` +
+                `Hey there! 👋 I'm the *${config.GAME_ACRONYM} Bot* — a live multiplayer word-guessing game built for WhatsApp groups.\n` +
+                `Players take turns guessing letters to reveal a hidden word. Miss 3 turns in a row and you're out! The last one standing wins. 🏆\n` +
+                `📏 *No fixed difficulty levels* — the word length quietly adapts round to round based on how the group is doing.\n` +
+                `${config.DIVIDER}\n` +
+                `*🎮 How to Play:*\n` +
                 `1️⃣ Type *${config.PREFIX} start* to open a lobby\n` +
                 `2️⃣ Type *${config.PREFIX} join* to enter it\n` +
                 `3️⃣ Guess a letter, or the full word for an instant win ⚡\n` +
@@ -247,11 +246,16 @@ async function handlePublicMessage(msgCtx) {
     const roundMaxTries = gameState.roundMaxTries || settings.maxTries
     const wrongCount = gameState.attempts[currentPlayerNumber]
 
-    // Per-player DM stick figure, fired the moment THIS player misses —
-    // naturally staggered across real gameplay, never a bulk broadcast.
+    // Per-player stick figure card, fired the moment THIS player misses.
+    // Posted in the GROUP (not a private DM) tagged with their name and
+    // strike count, so everyone sees it live and dynamically per player.
     try {
-        const dmJid = resolveJid(senderNumber, gameState.playerJids)
-        await sendSafeMessage(sock, dmJid, { text: engine.buildStickFigureDM(wrongCount, roundMaxTries) })
+        const playerTag = nameTag(senderNumber, nameCache, settings)
+        const playerJid = resolveJid(senderNumber, gameState.playerJids)
+        await sock.sendMessage(from, {
+            text: engine.buildStickFigureCard(playerTag, wrongCount, roundMaxTries),
+            mentions: playerJid ? [playerJid] : []
+        })
     } catch (_) {}
 
     const feedback =

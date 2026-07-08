@@ -18,7 +18,7 @@
 const crypto = require('crypto')
 
 const { TIERS, writeSetting, resolveSetting, nameTag } = require('../permissions')
-const { startActualGame } = require('./gameEngine')
+const { startActualGame, openFreshLobby } = require('./gameEngine')
 const config = require('./config')
 
 // ─── Pending key sessions ────────────────────────────────────
@@ -118,14 +118,14 @@ function buildHelpText(settings, forCreator = false, section = null) {
         : `🛡️ *Administrator*`
 
     const header =
-        `╔══════════════════════════╗\n` +
-        `   🎮  ${config.GAME_ACRONYM} Admin Dashboard\n` +
-        `╚══════════════════════════╝\n` +
+        `${config.DIVIDER}\n` +
+        `${config.BOT_EMOJI} *${config.GAME_ACRONYM} Admin Dashboard*\n` +
+        `${config.DIVIDER}\n` +
         `${tier}\n` +
         `_Sky Graphics — ${config.GAME_NAME}_\n\n`
 
     const footer =
-        `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `${config.DIVIDER}\n` +
         `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
 
     const liveConfig =
@@ -264,14 +264,14 @@ async function handleAdminCommand(ctx) {
         if (senderIsCreator) {
             await sendSafeMessage(sock, senderJid, {
                 text:
-                    `╔══════════════════════════╗\n` +
+                    `${config.DIVIDER}\n` +
                     `   🔐  Sky Graphics Creator\n` +
-                    `╚══════════════════════════╝\n\n` +
+                    `${config.DIVIDER}\n\n` +
                     `Welcome back, *Founder*. 👋\n\n` +
                     `You have *unrestricted access* to every function of this bot — ` +
                     `no keys, no approvals, no gates.\n\n` +
                     `Type */hmg help* to open the full dashboard.\n\n` +
-                    `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `${config.DIVIDER}\n` +
                     `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
             })
             return
@@ -280,13 +280,13 @@ async function handleAdminCommand(ctx) {
         if (isAdmin && settings.adminNumber !== '') {
             await sendSafeMessage(sock, senderJid, {
                 text:
-                    `╔══════════════════════════╗\n` +
+                    `${config.DIVIDER}\n` +
                     `   👑  ${config.GAME_ACRONYM} Administrator\n` +
-                    `╚══════════════════════════╝\n\n` +
+                    `${config.DIVIDER}\n\n` +
                     `Welcome back, *Administrator*. 👋\n\n` +
                     `You have full control of the *${config.GAME_ACRONYM} Bot* for your community.\n\n` +
                     `Type */hmg help* to open your full dashboard.\n\n` +
-                    `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `${config.DIVIDER}\n` +
                     `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
             })
             return
@@ -392,13 +392,13 @@ async function handleAdminCommand(ctx) {
 
             await sendSafeMessage(sock, confirmedJid, {
                 text:
-                    `╔══════════════════════════╗\n` +
+                    `${config.DIVIDER}\n` +
                     `   👑  Access Granted\n` +
-                    `╚══════════════════════════╝\n\n` +
+                    `${config.DIVIDER}\n\n` +
                     `Welcome, *Administrator!* 🎉\n\n` +
                     `You now have full control of the *${config.GAME_ACRONYM} Bot* for your community.\n\n` +
                     `Type */hmg help* to open your full dashboard.\n\n` +
-                    `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `${config.DIVIDER}\n` +
                     `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
             })
 
@@ -431,15 +431,15 @@ async function handleAdminCommand(ctx) {
 
         await sendSafeMessage(sock, requesterJid, {
             text:
-                `╔══════════════════════════╗\n` +
+                `${config.DIVIDER}\n` +
                 `   🔐  Admin Configuration\n` +
-                `╚══════════════════════════╝\n` +
+                `${config.DIVIDER}\n` +
                 `_${config.GAME_ACRONYM} Bot · by Sky Graphics_ 🎨\n\n` +
                 `Hello! 👋\n\n` +
                 `You're attempting to access the *Bot Administration Panel*.\n\n` +
                 `To proceed, enter the access key provided to you by the *Sky Graphics team*:\n\n` +
                 `\`/hmg admin YOURKEY\`\n\n` +
-                `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                `${config.DIVIDER}\n` +
                 `📩 Don't have a key? Contact Sky Graphics to request access.`
         })
 
@@ -447,9 +447,9 @@ async function handleAdminCommand(ctx) {
             try {
                 await sendSafeMessage(sock, creatorJid, {
                     text:
-                        `╔══════════════════════════╗\n` +
+                        `${config.DIVIDER}\n` +
                         `   🔔  Admin Access Request\n` +
-                        `╚══════════════════════════╝\n\n` +
+                        `${config.DIVIDER}\n\n` +
                         `Someone is requesting admin access to your bot.\n\n` +
                         `👤 *Name:* ${reqName}\n` +
                         `📱 *Number:* \`${senderNumber}\`\n` +
@@ -460,7 +460,7 @@ async function handleAdminCommand(ctx) {
                         `❌ To *deny* and void the key immediately:\n` +
                         `\`/hmg deny ${senderNumber}\`\n\n` +
                         `_If you do nothing, the key auto-expires in 10 minutes._\n\n` +
-                        `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                        `${config.DIVIDER}\n` +
                         `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
                 })
             } catch (err) {
@@ -507,9 +507,9 @@ async function handleAdminCommand(ctx) {
         try {
             await sendSafeMessage(sock, targetJid, {
                 text:
-                    `╔══════════════════════════╗\n` +
+                    `${config.DIVIDER}\n` +
                     `   🗝️  Your Access Key\n` +
-                    `╚══════════════════════════╝\n` +
+                    `${config.DIVIDER}\n` +
                     `_From the Sky Graphics Team_ 🎨\n\n` +
                     `Your request has been *approved*. ✅\n\n` +
                     `Here is your access key:\n\n` +
@@ -518,7 +518,7 @@ async function handleAdminCommand(ctx) {
                     `\`/hmg admin ${session.key}\`\n\n` +
                     `⏰ *This key expires in 10 minutes.*\n` +
                     `Do not share it with anyone.\n\n` +
-                    `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `${config.DIVIDER}\n` +
                     `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
             })
 
@@ -559,9 +559,9 @@ async function handleAdminCommand(ctx) {
         try {
             await sendSafeMessage(sock, targetJid, {
                 text:
-                    `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `${config.DIVIDER}\n` +
                     `_Sky Graphics · ${config.GAME_ACRONYM} Bot_ 🎨\n` +
-                    `━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+                    `${config.DIVIDER}\n\n` +
                     `Your access request could not be processed at this time.\n\n` +
                     `For further assistance, contact the *Sky Graphics* team directly. 📩`
             })
@@ -634,14 +634,17 @@ async function handleAdminCommand(ctx) {
                 text: `✅ *Admin updated to* \`${settings.adminNumber}\`\n\nNew admin must send any message to the bot so their JID is captured. 📡`
             })
             try {
-                await sendSafeMessage(sock, settings.adminNumber, {
+                // BUG FIX: this used to send to the bare phone number
+                // (e.g. "237682477421") instead of a real WhatsApp JID, so
+                // the welcome DM silently never delivered.
+                await sendSafeMessage(sock, `${settings.adminNumber}@s.whatsapp.net`, {
                     text:
-                        `╔══════════════════════════╗\n` +
+                        `${config.DIVIDER}\n` +
                         `   👑  You're the Admin\n` +
-                        `╚══════════════════════════╝\n\n` +
+                        `${config.DIVIDER}\n\n` +
                         `Welcome! 🎉 You have been assigned as the *${config.GAME_ACRONYM} Bot* administrator.\n\n` +
                         `Type */hmg help* to see all your commands.\n\n` +
-                        `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                        `${config.DIVIDER}\n` +
                         `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
                 })
             } catch (err) {
@@ -955,6 +958,18 @@ async function handleAdminCommand(ctx) {
                 })
             } else if (gs.active) {
                 await sendSafeMessage(sock, replyTo, { text: `⚠️ The game is already in progress — use */hmg end* to stop it first.` })
+            } else if (gs.cooldownActive) {
+                // BUG FIX: force-start used to fall through to "No active lobby
+                // found" during the 2-minute post-round cooldown, with no way to
+                // skip the wait. Now it breaks the cooldown and opens a fresh
+                // lobby immediately.
+                if (gs.cooldownTimer) clearInterval(gs.cooldownTimer)
+                gs.cooldownActive = false
+                persistGames()
+                await sendSafeMessage(sock, replyTo, { text: `⚡ *Cooldown skipped.* Opening a fresh lobby now. 🎮` })
+                await openFreshLobby(activeGameChat, {
+                    sock, games, settings, nameCache, activeGameChatRef, persistGames
+                })
             } else {
                 await sendSafeMessage(sock, replyTo, { text: `⚠️ No active lobby found. Open one with *${config.PREFIX} start* in the group.` })
             }

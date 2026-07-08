@@ -25,5 +25,13 @@ module.exports = {
     LOBBY_SECONDS:        60,
     TURN_SECONDS:         30,
     COOLDOWN_SECONDS:     120,  // 2-minute post-round discussion window
-    COOLDOWN_WARNING_AT:  30    // send "starting soon" ping at T-30s
+    COOLDOWN_WARNING_AT:  30,   // send "starting soon" ping at T-30s
+
+    // ── Shared brand identity (apply to every "card" message) ──
+    // Big structural messages (lobby open/close, help dashboard, match
+    // report) use BOT_EMOJI + DIVIDER for an instantly-recognizable
+    // header/footer band. Quick transactional replies (single-line
+    // confirmations, errors) skip this and stay minimal on purpose.
+    BOT_EMOJI:  '🤖',
+    DIVIDER:    '━━━━━━━━━━━━━━━━━━━━━━'
 }

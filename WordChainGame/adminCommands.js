@@ -1,54 +1,35 @@
 // ============================================================
 //  WordChainGame/adminCommands.js
-//  All "/wcg ..." admin commands. Kept lean — first person to
-//  claim admin gets it, creator can always reclaim/reset it.
+//  All "/wcg ..." admin commands. The public self-claim ("/wcg
+//  admin"-equivalent) lives in publicCommands.js per
+//  ARCHITECTURE.md §5 — everything below this point requires at
+//  least ADMIN tier, checked first, no exceptions.
 //
 //  NOTE: game switching (setgame / setadminaccess / status) is NOT
-//  handled here. Per the updated project architecture, that lives
-//  entirely behind the fixed `/game` prefix in the root index.js —
-//  no individual game's adminCommands.js wires it in anymore, so
-//  there's nothing to remove or maintain here if that dispatcher
-//  changes later.
+//  handled here — that lives entirely behind the fixed `/game`
+//  prefix in the root index.js, the same for every game.
 // ============================================================
 
 const { TIERS, getTier, resolveSetting, writeSetting } = require('../permissions')
 const { difficultyBadge, themeBadge } = require('./display')
 const config = require('./config')
+const gameEngine = require('./gameEngine')
 
 async function handleAdminCommand(ctx) {
     const {
-        sock, settings, words, saveSettings, saveWords, senderNumber, senderJid, senderName,
+        sock, settings, words, saveSettings, saveWords, senderNumber, senderJid,
         sender, body, games, activeGameChatRef, persistGames, getGameState,
-        startTurnCountdown, senderTier, senderIsAdmin
+        senderTier, senderIsAdmin, buildCtx
     } = ctx
 
     const tier = senderTier || getTier(senderNumber, settings, senderJid)
     const senderIsCreator = tier === TIERS.CREATOR
-    const isAdmin = typeof senderIsAdmin === 'boolean' ? senderIsAdmin : (tier === TIERS.ADMIN || tier === TIERS.CREATOR)
 
-    const parts = body.trim().split(/\s+/)   // e.g. ['/wcg', 'set', 'difficulty', 'normal']
-    const cmd   = parts.slice(1)             // cmd[0]=command, cmd[1]+=args
-    const arg1  = cmd[1] || ''
-    const arg2  = cmd[2] || ''
-
-    async function reply(text) {
-        await sock.sendMessage(sender, { text })
-    }
-
-    // ── /wcg admin — public: claim the admin role if unclaimed ──
-    if (cmd[0] === 'admin') {
-        if (settings.adminNumber) {
-            return reply(`⚠️ An admin is already set. Ask the Creator to run */wcg clearadmin* first if this needs to change.`)
-        }
-        settings.adminNumber = senderNumber
-        settings.adminJid    = senderJid
-        saveSettings()
-        return reply(`👑 *You're now the Word Chain Admin!*\nType */wcg help* to see everything you can configure.`)
-    }
-
-    // Everything below requires at least ADMIN tier.
+    // ── Gate FIRST, before looking at cmd[0] at all (ARCHITECTURE.md §5) ──
+    const isAdmin = typeof senderIsAdmin === 'boolean' ? senderIsAdmin : (tier === TIERS.ADMIN || senderIsCreator)
     if (!isAdmin) {
-        return reply(`🔒 That command is admin-only. Type */wcg admin* to claim the role if it's unclaimed.`)
+        await sock.sendMessage(sender, { text: `🔒 That command is admin-only. Type */wcg admin* to claim the role if it's unclaimed.` })
+        return
     }
 
     // Respect admin access scoping set by the creator (creator is never scoped).
@@ -57,6 +38,18 @@ async function handleAdminCommand(ctx) {
         if (scope !== 'all' && scope !== config.GAME_KEY) return
     }
 
+    const parts = body.trim().split(/\s+/)   // e.g. ['/wcg', 'pause']
+    const cmd   = parts.slice(1)
+    const arg1  = cmd[1] || ''
+    const arg2  = cmd[2] || ''
+
+    async function reply(text) {
+        await sock.sendMessage(sender, { text })
+    }
+
+    const chatId = sender   // the chat this admin command targets — always the chat it was sent in
+    const gameCtx = buildCtx ? buildCtx() : ctx
+
     if (cmd[0] === 'clearadmin') {
         settings.adminNumber = ''
         settings.adminJid    = ''
@@ -64,54 +57,26 @@ async function handleAdminCommand(ctx) {
         return reply(`✅ Admin cleared. Anyone can now claim it with */wcg admin*.`)
     }
 
-    if (cmd[0] === 'set') {
-        if (arg1 === 'difficulty') {
-            if (!['easy', 'normal', 'difficult'].includes(arg2)) {
-                return reply(`Usage: */wcg set difficulty easy|normal|difficult*`)
-            }
-            writeSetting(tier, `${config.GAME_KEY}_difficulty`, arg2, settings)
-            saveSettings()
-            return reply(`✅ Difficulty set to ${difficultyBadge(arg2)}. Takes effect next round.`)
-        }
-        if (arg1 === 'strikes') {
-            const n = parseInt(arg2, 10)
-            if (!Number.isInteger(n) || n < 1) return reply(`Usage: */wcg set strikes <number, 1 or more>*`)
-            writeSetting(tier, `${config.GAME_KEY}_maxStrikes`, n, settings)
-            saveSettings()
-            return reply(`✅ Max strikes set to *${n}*. Takes effect next round.`)
-        }
-        if (arg1 === 'timer') {
-            if (arg2 === 'auto') {
-                writeSetting(tier, `${config.GAME_KEY}_timerSeconds`, 'auto', settings)
-                saveSettings()
-                return reply(`✅ Turn timer reset to automatic (difficulty-based).`)
-            }
-            const n = parseInt(arg2, 10)
-            if (!Number.isInteger(n)) return reply(`Usage: */wcg set timer <seconds>* or */wcg set timer auto*`)
-            if (n < config.MIN_TIMER_SECONDS) return reply(`⚠️ ${config.MIN_TIMER_SECONDS}s is the minimum (connection reliability) — setting to ${config.MIN_TIMER_SECONDS}s instead.`)
-            writeSetting(tier, `${config.GAME_KEY}_timerSeconds`, Math.max(config.MIN_TIMER_SECONDS, n), settings)
-            saveSettings()
-            return reply(`✅ Turn timer set to *${Math.max(config.MIN_TIMER_SECONDS, n)}s*. Takes effect next round.`)
-        }
-        if (arg1 === 'theme') {
-            const themeKey = (arg2 || '').toLowerCase()
-            if (themeKey === 'none') {
-                words.activeTheme = 'none'
-                saveWords()
-                return reply(`✅ Theme cleared — standard dictionary words only.`)
-            }
-            if (!words.themes || !words.themes[themeKey]) {
-                const available = Object.keys(words.themes || {}).join(', ') || '(none yet)'
-                return reply(`⚠️ No theme called "${themeKey}". Available: ${available}, or *none*.`)
-            }
-            words.activeTheme = themeKey
+    // ── Theme word-bank management (unchanged — themes stay admin-editable) ──
+    if (cmd[0] === 'set' && arg1 === 'theme') {
+        const themeKey = (arg2 || '').toLowerCase()
+        if (themeKey === 'none') {
+            words.activeTheme = 'none'
             saveWords()
-            return reply(`✅ Theme set to ${themeBadge(themeKey)}.\nThemed words are ACCEPTED alongside regular dictionary words — the dictionary is never replaced, so chains won't dead-end.`)
+            return reply(`✅ Theme cleared — standard dictionary words only.`)
         }
-        return reply(`Usage: */wcg set difficulty|strikes|timer|theme <value>*`)
+        if (!words.themes || !words.themes[themeKey]) {
+            const available = Object.keys(words.themes || {}).join(', ') || '(none yet)'
+            return reply(`⚠️ No theme called "${themeKey}". Available: ${available}, or *none*.`)
+        }
+        words.activeTheme = themeKey
+        saveWords()
+        return reply(`✅ Theme set to ${themeBadge(themeKey)}.\nThemed words are ACCEPTED alongside regular dictionary words — the dictionary is never replaced, so chains won't dead-end.`)
+    }
+    if (cmd[0] === 'set') {
+        return reply(`Usage: */wcg set theme <name|none>*\n_Difficulty (length/timer/strikes) is now fully automatic — see */wcg status*._`)
     }
 
-    // ── Theme word-bank management ──
     if (cmd[0] === 'listthemes') {
         const names = Object.keys(words.themes || {})
         return reply(`🎨 *Available Themes:* ${names.length ? names.join(', ') : '(none)'}\nActive: *${words.activeTheme || 'none'}*`)
@@ -144,66 +109,74 @@ async function handleAdminCommand(ctx) {
         return reply(`📖 *${theme}:* ${words.themes[theme].join(', ') || '[empty]'}`)
     }
 
+    // ── Pause / resume — resume now preserves remaining turn time ──
     if (cmd[0] === 'pause') {
-        const gs = getGameState(sender, games)
+        const gs = getGameState(chatId, games)
         if (!gs.active) return reply(`⚠️ No active round to pause.`)
         gs.paused = true
         if (gs.turnTimer) clearInterval(gs.turnTimer)
         persistGames()
-        await sock.sendMessage(sender, { text: `⏸️ *Word Chain paused* by an admin.` })
-        return
+        return reply(`⏸️ *Word Chain paused* by an admin. ${gs.turnSecondsLeft}s were left on the clock — resuming will pick up from there, not reset.`)
     }
 
     if (cmd[0] === 'resume') {
-        const gs = getGameState(sender, games)
+        const gs = getGameState(chatId, games)
         if (!gs.active || !gs.paused) return reply(`⚠️ Nothing is paused right now.`)
         gs.paused = false
         persistGames()
-        await sock.sendMessage(sender, { text: `▶️ *Word Chain resumed!*` })
-        startTurnCountdown(sender)
+        await reply(`▶️ *Word Chain resumed!* ${gs.turnSecondsLeft}s left on this turn.`)
+        gameEngine.startTurnCountdown(chatId, gameCtx, { preserveRemaining: true })
         return
     }
 
+    // ── end/stop — always guards activeGameChatRef, always sends a report ──
     if (cmd[0] === 'end' || cmd[0] === 'stop') {
-        const gs = getGameState(sender, games)
+        const gs = getGameState(chatId, games)
+        if (!gs.active && !gs.lobbyActive) return reply(`⚠️ No active game or lobby in this chat.`)
+
+        const wasActive = gs.active
         gs.active = false
         gs.lobbyActive = false
-        if (gs.turnTimer) clearInterval(gs.turnTimer)
+        if (gs.turnTimer)  clearInterval(gs.turnTimer)
         if (gs.lobbyTimer) clearInterval(gs.lobbyTimer)
-        activeGameChatRef.value = null
+
+        // Only release the global lock if IT WAS THIS CHAT holding it — an
+        // admin stopping Chat A's game must never sever Chat B's live lock.
+        if (activeGameChatRef.value === chatId) activeGameChatRef.value = null
+
         persistGames()
-        await sock.sendMessage(sender, { text: `🛑 *Word Chain ended* by an admin.` })
+
+        if (wasActive) {
+            await gameEngine.endMatch(chatId, gs, gameCtx, { type: 'admin_stop' })
+        } else {
+            await reply(`🛑 *Lobby cancelled* by an admin.`)
+        }
         return
     }
 
     if (cmd[0] === 'status') {
-        const difficulty = resolveSetting(`${config.GAME_KEY}_difficulty`, settings, 'easy')
-        const timer      = resolveSetting(`${config.GAME_KEY}_timerSeconds`, settings, 'auto')
-        const strikes    = resolveSetting(`${config.GAME_KEY}_maxStrikes`, settings, config.DEFAULT_MAX_STRIKES)
-        const gs = getGameState(sender, games)
+        const gs = getGameState(chatId, games)
+        const cfg = gameEngine.roundConfigForTier(gs.tier)
         return reply(
             `📊 *Word Chain Status*\n\n` +
-            `Difficulty: ${difficultyBadge(difficulty)}\n` +
-            `Timer: ${timer === 'auto' ? 'Auto (difficulty-based)' : `${timer}s manual`}\n` +
-            `Max strikes: ${strikes}\n` +
+            `Auto-difficulty: ${difficultyBadge(cfg.tierName)} _(tier ${cfg.tierIndex}/${config.MAX_TIER}, auto-adjusts after each match)_\n` +
+            `Word length: ${cfg.minLength}+ | Timer: ${cfg.timerSeconds}s | Strikes: ${cfg.maxStrikes}\n` +
             `Active theme: ${words.activeTheme || 'none'}\n` +
             `Admin: ${settings.adminNumber || '(unclaimed)'}\n` +
-            `Active round in this chat: ${gs.active ? 'Yes' : 'No'}\n` +
+            `Active round in this chat: ${gs.active ? 'Yes' : 'No'}${gs.paused ? ' (paused)' : ''}\n` +
             `Lobby open in this chat: ${gs.lobbyActive ? 'Yes' : 'No'}`
         )
     }
 
     return reply(
         `🔧 *Word Chain Admin Commands*\n\n` +
-        `*/wcg set difficulty easy|normal|difficult*\n` +
-        `*/wcg set strikes <n>*\n` +
-        `*/wcg set timer <seconds|auto>*\n` +
         `*/wcg set theme <name|none>*\n` +
         `*/wcg listthemes* · */wcg listthemewords [theme]*\n` +
         `*/wcg addthemeword [theme] [word]* · */wcg removethemeword [theme] [word]*\n` +
         `*/wcg pause* / */wcg resume* / */wcg end*\n` +
         `*/wcg status*\n` +
         `*/wcg clearadmin*\n\n` +
+        `_Difficulty is fully automatic now — no set difficulty|strikes|timer. It drifts after each match based on how the group did._\n` +
         `_Switching games or scoping admin access is done via the platform-level_ */game* _command, not here._`
     )
 }

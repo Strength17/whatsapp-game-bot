@@ -108,39 +108,90 @@ function adjustNextWordLength(gameState, outcome) {
     )
 }
 
-// ─── Stick figure ASCII art (text-only, no images) ──────────────
-// 6 body parts lost in sequence as wrong guesses climb toward the
-// round's maxTries: body, left leg, left arm, right arm, right leg,
-// head (last). Stage is proportional to wrongCount/maxTries so it
-// works no matter what maxTries auto-resolves to for that word.
+// ─── Stick figure ASCII art — 10 atomic damage stages ───────────
+// Locked-in design: legs first, each limb gets a "hit" sub-stage
+// before it's fully "gone", so there are 10 distinct art states —
+// matching config's max possible maxTries (10). Because there are
+// never fewer stages than possible wrong guesses, no two wrong
+// guesses in a row can ever render the identical picture.
+//
+// Order: Right Leg hit→gone → Left Leg hit→gone → Right Arm hit→gone
+//        → Left Arm hit→gone → Torso gone → Head gone (disqualified)
+//
+// Each part has 3 states: whole ('/', '\', '|', 'O') → hit ('x') → gone (' ').
+const STICK_STAGES = [
+    // stage 0 = full figure (used only for reference / round start, never sent as a "loss" frame)
+    { rleg: 'w', lleg: 'w', rarm: 'w', larm: 'w', torso: 'w', head: 'w', part: null,        state: null   },
+    { rleg: 'x', lleg: 'w', rarm: 'w', larm: 'w', torso: 'w', head: 'w', part: 'Right Leg', state: 'hit'  },
+    { rleg: 'g', lleg: 'w', rarm: 'w', larm: 'w', torso: 'w', head: 'w', part: 'Right Leg', state: 'gone' },
+    { rleg: 'g', lleg: 'x', rarm: 'w', larm: 'w', torso: 'w', head: 'w', part: 'Left Leg',  state: 'hit'  },
+    { rleg: 'g', lleg: 'g', rarm: 'w', larm: 'w', torso: 'w', head: 'w', part: 'Left Leg',  state: 'gone' },
+    { rleg: 'g', lleg: 'g', rarm: 'x', larm: 'w', torso: 'w', head: 'w', part: 'Right Arm', state: 'hit'  },
+    { rleg: 'g', lleg: 'g', rarm: 'g', larm: 'w', torso: 'w', head: 'w', part: 'Right Arm', state: 'gone' },
+    { rleg: 'g', lleg: 'g', rarm: 'g', larm: 'x', torso: 'w', head: 'w', part: 'Left Arm',  state: 'hit'  },
+    { rleg: 'g', lleg: 'g', rarm: 'g', larm: 'g', torso: 'w', head: 'w', part: 'Left Arm',  state: 'gone' },
+    { rleg: 'g', lleg: 'g', rarm: 'g', larm: 'g', torso: 'g', head: 'w', part: 'Torso',     state: 'gone' },
+    { rleg: 'g', lleg: 'g', rarm: 'g', larm: 'g', torso: 'g', head: 'g', part: 'Head',      state: 'gone' }
+]
+
+const PART_EMOJI = {
+    'Right Leg': '🦵', 'Left Leg': '🦵', 'Right Arm': '💪', 'Left Arm': '💪',
+    'Torso': '🫥', 'Head': '💀'
+}
+
+function renderChar(code, whole, hit) {
+    if (code === 'w') return whole
+    if (code === 'x') return hit
+    return ' ' // gone
+}
+
 function buildStickFigureArt(stage) {
-    const head = stage >= 6 ? ' ' : 'O'
-    const larm = stage >= 3 ? ' ' : '/'
-    const body = stage >= 1 ? ' ' : '|'
-    const rarm = stage >= 4 ? ' ' : '\\'
-    const lleg = stage >= 2 ? ' ' : '/'
-    const rleg = stage >= 5 ? ' ' : '\\'
+    const s     = STICK_STAGES[Math.max(0, Math.min(10, stage))]
+    const head  = renderChar(s.head,  'O', 'x')
+    const larm  = renderChar(s.larm,  '/', 'x')
+    const torso = renderChar(s.torso, '|', 'x')
+    const rarm  = renderChar(s.rarm,  '\\', 'x')
+    const lleg  = renderChar(s.lleg,  '/', 'x')
+    const rleg  = renderChar(s.rleg,  '\\', 'x')
     return (
-        ` ____\n` +
-        `|    ${head}\n` +
-        `|   ${larm}${body}${rarm}\n` +
-        `|   ${lleg} ${rleg}\n` +
-        `|\n` +
-        `_|_`
+        ` ______\n` +
+        ` |    |\n` +
+        ` |    ${head}\n` +
+        ` |   ${larm}${torso}${rarm}\n` +
+        ` |   ${lleg} ${rleg}\n` +
+        `_|__`
     )
 }
 
-function buildStickFigureDM(wrongCount, maxTries) {
-    const stage     = Math.min(6, Math.round((wrongCount / Math.max(1, maxTries)) * 6))
+// Maps wrongCount/maxTries onto one of the 10 stages. Math.round keeps
+// the sequence strictly increasing (and always distinct) for every
+// maxTries from 5–10, and the final wrong guess always lands exactly
+// on stage 10 (head gone / disqualified).
+function resolveStickStage(wrongCount, maxTries) {
+    const raw = Math.round((wrongCount / Math.max(1, maxTries)) * 10)
+    return Math.max(1, Math.min(10, raw))
+}
+
+// Group-chat card: tagged with the player's name + strike count, sent
+// the moment THIS player misses — dynamic and per-player, replacing
+// the old private-DM-only behaviour.
+function buildStickFigureCard(playerTag, wrongCount, maxTries) {
+    const stage     = resolveStickStage(wrongCount, maxTries)
+    const s         = STICK_STAGES[stage]
     const art       = buildStickFigureArt(stage)
+    const emoji     = PART_EMOJI[s.part] || '💥'
+    const captionOp = s.state === 'gone'
+        ? `gone!${s.part === 'Head' ? ' Disqualified 💀' : ''}`
+        : 'hit!'
     const remaining = Math.max(0, maxTries - wrongCount)
+
     return (
-        `💀 *Your HangMan Figure*\n\n` +
+        `💀 *${playerTag} — Strike ${wrongCount}/${maxTries}!*\n\n` +
         '```' + art + '```\n' +
-        `Wrong guesses: *${wrongCount}/${maxTries}*\n` +
-        (stage >= 6
-            ? `Your figure is gone — you've been disqualified. 🚫`
-            : `${remaining} wrong guess${remaining === 1 ? '' : 'es'} left before you're out. Hang in there! 🙌`)
+        `${emoji} *Lost: ${s.part} — ${captionOp}*\n` +
+        (stage >= 10
+            ? `Figure is gone — *${playerTag}* has been disqualified. 🚫`
+            : `${remaining} wrong guess${remaining === 1 ? '' : 'es'} left before elimination. Hang in there! 🙌`)
     )
 }
 
@@ -261,7 +312,9 @@ async function openFreshLobby(chatId, ctx) {
 
     await sock.sendMessage(chatId, {
         text:
-            `🎮 *${config.GAME_NAME} (${config.GAME_ACRONYM}) is Starting!*\n\n` +
+            `${config.DIVIDER}\n` +
+            `${config.BOT_EMOJI} *${config.GAME_NAME} (${config.GAME_ACRONYM}) is Starting!*\n` +
+            `${config.DIVIDER}\n\n` +
             `📏 Word length this round: *~${gameState.wordLengthTarget} letters*\n\n` +
             `You have *${config.LOBBY_SECONDS} seconds* to join! ⏱️\n\n` +
             `👥 *Current Lobby:*\n${autoJoinText}\n\n` +
@@ -311,7 +364,9 @@ async function startActualGame(chatId, ctx) {
 
     await sock.sendMessage(chatId, {
         text:
-            `🎬 *Lobby Closed — Game On!*\n\n` +
+            `${config.DIVIDER}\n` +
+            `${config.BOT_EMOJI} *Lobby Closed — Game On!*\n` +
+            `${config.DIVIDER}\n\n` +
             `📏 *Word length:* ${gameState.targetWord.length} letters\n` +
             `💥 *Attempts per player:* ${gameState.roundMaxTries}\n\n` +
             `👥 *Final Player Lineup:*\n${lobbyText}\n\n` +
@@ -320,7 +375,11 @@ async function startActualGame(chatId, ctx) {
     })
 
     persistGames()
-    startTurnCountdown(chatId, ctx)
+    // BUG FIX: this used to call startTurnCountdown() directly, which
+    // starts the 30s timer but never shows the masked word / whose-turn
+    // message — so round 1 (and every force-started round) began silently.
+    // sendGameBoard() renders that first board AND starts the countdown.
+    await sendGameBoard(chatId, '', [], ctx)
 }
 
 // ─── Game board ───────────────────────────────────────────────
@@ -494,7 +553,7 @@ function startCooldown(chatId, ctx) {
 
     sock.sendMessage(chatId, {
         text:
-            `🏁 *Round over!* Take a *${Math.round(config.COOLDOWN_SECONDS / 60)}-minute break* to chat before the next round. 💬\n` +
+            `${config.BOT_EMOJI} 🏁 *Round over!* Take a *${Math.round(config.COOLDOWN_SECONDS / 60)}-minute break* to chat before the next round. 💬\n` +
             `_A fresh lobby opens automatically when time's up — no need to type anything._`
     })
     persistGames()
@@ -542,5 +601,5 @@ module.exports = {
     resolveRoundMaxTries,
     pickWordForLength,
     adjustNextWordLength,
-    buildStickFigureDM
+    buildStickFigureCard
 }

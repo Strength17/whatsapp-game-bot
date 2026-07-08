@@ -157,6 +157,31 @@ async function stopSession(chatId, ctx, reason = 'manual') {
     if (reason === 'rounds_complete') scheduleAutoRestart(chatId, ctx)
 }
 
+// ─── Force-stop — optional contract addition (ARCHITECTURE.md §10) ──
+// Called ONLY by game-switch-commands.js, ONLY when the creator runs
+// "/game setgame ..." while Target Numbers has a live session in this
+// chat. Deliberately NOT the same as stopSession() above — stopSession
+// sends a full session report and manages its own auto-restart/
+// activeGameChatRef logic, which would mean the player sees a session
+// report AND a "game switched" message for one action, and would fight
+// game-switch-commands.js over who clears activeGameChatRef. This stays
+// silent and minimal, matching the contract every other game's
+// forceStopActiveSession follows: clear timers, reset to idle, tell the
+// caller whether anything was actually running, nothing more.
+function forceStopActiveSession(chatId, ctx) {
+    const { games, persistGames } = ctx
+    const gameState = getGameState(chatId, games)
+
+    const wasRunning = !!(gameState.active || gameState.roundActive)
+
+    clearTimers(gameState)
+    gameState.active      = false
+    gameState.roundActive = false
+
+    if (typeof persistGames === 'function') persistGames()
+    return wasRunning
+}
+
 function scheduleAutoRestart(chatId, ctx) {
     const { sock, games } = ctx
     const gameState = getGameState(chatId, games)
@@ -454,5 +479,6 @@ module.exports = {
     startRound,
     handleGuessAttempt,
     getHint,
-    tierBadge
+    tierBadge,
+    forceStopActiveSession
 }

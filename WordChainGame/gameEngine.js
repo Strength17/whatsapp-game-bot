@@ -6,6 +6,20 @@
 //  and the once-per-match auto-tier drift that carries into the
 //  NEXT match. No admin logic, no command-string parsing — that
 //  lives in adminCommands.js / publicCommands.js.
+//
+//  ── IMPORTANT: timer handles are NEVER stored on gameState ──
+//  `gameState` (via getGameState) is exactly what `persistGames()`
+//  serializes to disk. A raw setInterval/setTimeout handle is a
+//  Node `Timeout` object with internal circular references —
+//  JSON.stringify on it throws "Converting circular structure to
+//  JSON". Storing one on gameState (the previous design) meant
+//  persistGames() would throw the instant a timer existed, and
+//  because that call sits inside an async setInterval callback —
+//  not covered by index.js's per-message try/catch — the failure
+//  was silent: the round would go dead right after a card message,
+//  with no error visible to players or the admin. All three timer
+//  handles now live in `timerStore`, a module-level Map keyed by
+//  chatId, completely outside anything that ever gets persisted.
 // ============================================================
 
 const matchSummary = require('./matchSummary')
@@ -23,6 +37,27 @@ const {
 } = require('./config')
 const { DEFAULT_WORDS } = require('./themeBank')
 
+// ─── In-memory-only timer registry — see header note above ─────────
+// Never read from or written to games.json. Lost on process restart,
+// which is fine: a restart already orphans any live round (a known,
+// pre-existing limitation), and this keeps persisted state 100% JSON-safe.
+const timerStore = new Map()
+
+function getTimers(chatId) {
+    if (!timerStore.has(chatId)) timerStore.set(chatId, { lobbyTimer: null, turnTimer: null, matchTimer: null })
+    return timerStore.get(chatId)
+}
+
+function clearAllTimers(chatId) {
+    const t = getTimers(chatId)
+    if (t.lobbyTimer) clearInterval(t.lobbyTimer)
+    if (t.turnTimer)  clearInterval(t.turnTimer)
+    if (t.matchTimer) clearInterval(t.matchTimer)
+    t.lobbyTimer = null
+    t.turnTimer  = null
+    t.matchTimer = null
+}
+
 // A send that can never take down a timer callback with it. setInterval/
 // setTimeout bodies aren't covered by index.js's per-message try/catch,
 // so every send from inside one is wrapped here (ARCHITECTURE.md §6/§8).
@@ -31,6 +66,23 @@ async function safeSend(sock, jid, payload) {
         await sock.sendMessage(jid, payload)
     } catch (err) {
         console.log(`[WordChain] sendMessage failed for ${jid}:`, err && err.message)
+    }
+}
+
+// Wraps an entire setInterval/setTimeout async body so a bug ANYWHERE in
+// it (not just the sends) can never silently kill the timer or leave a
+// round stuck with zero explanation to the group — defense in depth per
+// ARCHITECTURE.md §8, since this class of callback is otherwise uncaught.
+function guardedTimerCallback(sock, chatId, fn) {
+    return async (...args) => {
+        try {
+            await fn(...args)
+        } catch (err) {
+            console.log(`[WordChain] timer callback error in ${chatId}:`, err && err.stack || err)
+            await safeSend(sock, chatId, {
+                text: `⚠️ *Word Chain hit a snag and had to stop this round.* An admin can check */wcg status* or run */wcg end* + */wcg start* to get a fresh one going.`
+            })
+        }
     }
 }
 
@@ -93,6 +145,8 @@ async function maybeRotateTheme(chatId, gameState, ctx) {
 // ─── getGameState ───────────────────────────────────────────────
 // State is stored under a GAME_KEY-prefixed key (not the bare chatId) —
 // `games` is shared across every game module (ARCHITECTURE.md §4).
+// This object is exactly what persistGames() writes to disk, so it must
+// stay 100% plain-JSON-serializable — no Timer handles, no functions.
 function stateKey(chatId) {
     return `${GAME_KEY}:${chatId}`
 }
@@ -103,11 +157,8 @@ function getGameState(chatId, games) {
         games[key] = {
             active:            false,
             lobbyActive:       false,
-            lobbyTimer:        null,
             lobbySecondsLeft:  LOBBY_SECONDS,
-            turnTimer:         null,
             turnSecondsLeft:   30,
-            matchTimer:        null,
             matchSecondsLeft:  0,
             matchDurationSeconds: MATCH_DURATION_SECONDS,
             players:           [],
@@ -147,6 +198,11 @@ function getGameState(chatId, games) {
     if (!gs.strikesTotalByPlayer) gs.strikesTotalByPlayer = {}
     if (typeof gs.matchDurationSeconds !== 'number') gs.matchDurationSeconds = MATCH_DURATION_SECONDS
     if (typeof gs.matchSecondsLeft !== 'number') gs.matchSecondsLeft = 0
+    // Purge any lingering non-serializable remnants from a pre-fix save —
+    // these fields must never live on the persisted object (see header note).
+    delete gs.lobbyTimer
+    delete gs.turnTimer
+    delete gs.matchTimer
     return gs
 }
 
@@ -188,18 +244,19 @@ async function openLobby(chatId, ctx, opts = {}) {
 function startLobbyCountdown(chatId, ctx) {
     const { sock, games, persistGames } = ctx
     const gameState = getGameState(chatId, games)
-    if (gameState.lobbyTimer) clearInterval(gameState.lobbyTimer)
+    const timers = getTimers(chatId)
+    if (timers.lobbyTimer) clearInterval(timers.lobbyTimer)
 
-    gameState.lobbyTimer = setInterval(async () => {
+    timers.lobbyTimer = setInterval(guardedTimerCallback(sock, chatId, async () => {
         if (!gameState.lobbyActive) {
-            clearInterval(gameState.lobbyTimer)
+            clearInterval(timers.lobbyTimer)
             return
         }
 
         gameState.lobbySecondsLeft--
 
         if (gameState.lobbySecondsLeft <= 0) {
-            clearInterval(gameState.lobbyTimer)
+            clearInterval(timers.lobbyTimer)
             await startActualGame(chatId, ctx)
         } else if (gameState.lobbySecondsLeft % 10 === 0) {
             const cfg = roundConfigForTier(gameState.tier)
@@ -218,15 +275,16 @@ function startLobbyCountdown(chatId, ctx) {
             })
         }
         persistGames()
-    }, 1000)
+    }), 1000)
 }
 
 // ─── Start actual game ────────────────────────────────────────────
 async function startActualGame(chatId, ctx) {
     const { sock, games, settings, activeGameChatRef, persistGames } = ctx
     const gameState = getGameState(chatId, games)
+    const timers = getTimers(chatId)
     gameState.lobbyActive = false
-    if (gameState.lobbyTimer) clearInterval(gameState.lobbyTimer)
+    if (timers.lobbyTimer) clearInterval(timers.lobbyTimer)
 
     if (gameState.players.length === 0) {
         gameState.active = false
@@ -264,6 +322,11 @@ async function startActualGame(chatId, ctx) {
     const openerJid    = gameState.playerJids[openerNumber]
     const minutesLabel = Math.round(gameState.matchDurationSeconds / 60 * 10) / 10
 
+    // persistGames() runs BEFORE anything else after this point can throw,
+    // and gameState is now guaranteed plain-JSON — no more silent death
+    // between "Lobby Closed" and the round actually starting.
+    persistGames()
+
     await safeSend(sock, chatId, {
         text: card('Lobby Closed — Word Chain is ON!',
             `🎯 *Mode:* ${difficultyBadge(cfg.tierName)} _(auto — starts here, climbs as the chain grows)_ — words must be *${cfg.minLength}+ letters*\n` +
@@ -276,7 +339,6 @@ async function startActualGame(chatId, ctx) {
         mentions: openerJid ? [openerJid] : []
     })
 
-    persistGames()
     startTurnCountdown(chatId, ctx)
     startMatchCountdown(chatId, ctx)
 }
@@ -325,15 +387,16 @@ async function sendChainBoard(chatId, actionFeedback = '', ctx) {
 function startTurnCountdown(chatId, ctx, opts = {}) {
     const { sock, games, settings, persistGames } = ctx
     const gameState = getGameState(chatId, games)
-    if (gameState.turnTimer) clearInterval(gameState.turnTimer)
+    const timers = getTimers(chatId)
+    if (timers.turnTimer) clearInterval(timers.turnTimer)
 
     if (!opts.preserveRemaining) {
         gameState.turnSecondsLeft = gameState.roundTimerSeconds || 30
     }
 
-    gameState.turnTimer = setInterval(async () => {
+    timers.turnTimer = setInterval(guardedTimerCallback(sock, chatId, async () => {
         if (!gameState.active || gameState.paused) {
-            clearInterval(gameState.turnTimer)
+            clearInterval(timers.turnTimer)
             return
         }
 
@@ -344,7 +407,7 @@ function startTurnCountdown(chatId, ctx, opts = {}) {
         const currentPlayerName   = nameTag(currentPlayerNumber, gameState.playerNames, settings)
 
         if (gameState.turnSecondsLeft <= 0) {
-            clearInterval(gameState.turnTimer)
+            clearInterval(timers.turnTimer)
             await applyStrike(chatId, currentPlayerNumber, `⏰ *Timeout!* ${currentPlayerName} ran out of time.`, ctx)
         } else if (gameState.turnSecondsLeft === 10) {
             await safeSend(sock, chatId, {
@@ -359,7 +422,7 @@ function startTurnCountdown(chatId, ctx, opts = {}) {
         }
 
         persistGames()
-    }, 1000)
+    }), 1000)
 }
 
 // ─── Match-duration countdown — the ONLY clock that can end a match
@@ -368,11 +431,12 @@ function startTurnCountdown(chatId, ctx, opts = {}) {
 function startMatchCountdown(chatId, ctx) {
     const { sock, games, persistGames } = ctx
     const gameState = getGameState(chatId, games)
-    if (gameState.matchTimer) clearInterval(gameState.matchTimer)
+    const timers = getTimers(chatId)
+    if (timers.matchTimer) clearInterval(timers.matchTimer)
 
-    gameState.matchTimer = setInterval(async () => {
+    timers.matchTimer = setInterval(guardedTimerCallback(sock, chatId, async () => {
         if (!gameState.active) {
-            clearInterval(gameState.matchTimer)
+            clearInterval(timers.matchTimer)
             return
         }
         if (gameState.paused) return   // frozen together with the turn timer
@@ -380,7 +444,7 @@ function startMatchCountdown(chatId, ctx) {
         gameState.matchSecondsLeft--
 
         if (gameState.matchSecondsLeft <= 0) {
-            clearInterval(gameState.matchTimer)
+            clearInterval(timers.matchTimer)
             await endMatchByTime(chatId, ctx)
         } else if (gameState.matchSecondsLeft === 60) {
             await safeSend(sock, chatId, { text: `⏳ *1 minute left in this match!*` })
@@ -390,7 +454,7 @@ function startMatchCountdown(chatId, ctx) {
             await safeSend(sock, chatId, { text: `🚨 *10 seconds — final words!*` })
         }
         persistGames()
-    }, 1000)
+    }), 1000)
 }
 
 // Picks a result when the match clock — not play — ends the round.
@@ -417,8 +481,7 @@ async function endMatchByTime(chatId, ctx) {
     if (!gameState.active) return
 
     gameState.active = false
-    if (gameState.turnTimer)  clearInterval(gameState.turnTimer)
-    if (gameState.matchTimer) clearInterval(gameState.matchTimer)
+    clearAllTimers(chatId)
     if (activeGameChatRef.value === chatId) activeGameChatRef.value = null
 
     const winnerNumber = pickTimeUpWinner(gameState)
@@ -463,8 +526,7 @@ async function checkChainMilestone(chatId, gameState, ctx) {
 // and (unless this was an admin-forced stop) schedules the engine's
 // own autopilot restart. No admin has to type /wcg start again. ────────
 async function endMatch(chatId, gameState, ctx, resultInfo, opts = {}) {
-    if (gameState.turnTimer)  clearInterval(gameState.turnTimer)
-    if (gameState.matchTimer) clearInterval(gameState.matchTimer)
+    clearAllTimers(chatId)
 
     const drift = driftTierForNextMatch(gameState)
     await matchSummary.sendMatchReport(
@@ -552,7 +614,8 @@ async function processWordSubmission(chatId, senderNumber, rawWord, ctx) {
     const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
     if (senderNumber !== currentPlayerNumber) return // not their turn — ignore silently
 
-    if (gameState.turnTimer) clearInterval(gameState.turnTimer)
+    const timers = getTimers(chatId)
+    if (timers.turnTimer) clearInterval(timers.turnTimer)
 
     const word = (rawWord || '').trim().toLowerCase()
     const currentPlayerName = nameTag(senderNumber, gameState.playerNames, settings)
@@ -602,6 +665,32 @@ async function processWordSubmission(chatId, senderNumber, rawWord, ctx) {
     await sendChainBoard(chatId, feedback, ctx)
 }
 
+// ─── Force-stop — optional contract addition (ARCHITECTURE.md §10) ──
+// Called ONLY by game-switch-commands.js, ONLY when the creator runs
+// "/game setgame ..." while Word Chain has a live session in this chat.
+// Reuses clearAllTimers() (the same in-memory timerStore every other
+// timer function here already goes through) so there's exactly one
+// place that knows how to tear down lobby/turn/match timers — no
+// duplicated timer-clearing logic to drift out of sync.
+// Never sends a chat message itself — the caller (game-switch-commands.js)
+// reports what was stopped, once, in its own confirmation message.
+// Returns true if something was actually running (worth reporting),
+// false if there was nothing to clean up.
+function forceStopActiveSession(chatId, ctx) {
+    const { games, persistGames } = ctx
+    const gameState = getGameState(chatId, games)
+
+    const wasRunning = !!(gameState.active || gameState.lobbyActive)
+
+    clearAllTimers(chatId)
+    gameState.active      = false
+    gameState.lobbyActive = false
+    gameState.paused      = false
+
+    if (typeof persistGames === 'function') persistGames()
+    return wasRunning
+}
+
 module.exports = {
     DEFAULT_WORDS,
     stateKey,
@@ -610,6 +699,8 @@ module.exports = {
     themeWordsFor,
     matchDurationSecondsFor,
     getGameState,
+    getTimers,
+    clearAllTimers,
     openLobby,
     startLobbyCountdown,
     startActualGame,
@@ -622,5 +713,6 @@ module.exports = {
     pickTimeUpWinner,
     endMatch,
     endMatchByTime,
-    safeSend
+    safeSend,
+    forceStopActiveSession
 }

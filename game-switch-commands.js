@@ -9,6 +9,7 @@
 //    /game setgame [key]         — switch which game is currently active
 //    /game setadminaccess [key|all] — scope which game(s) the admin may operate
 //    /game status                 — show what's active + what's available
+//    /game roletags on|off        — bot-wide (Creator)/(Admin) name tag toggle
 //
 //  index.js calls handleGameSwitchCommands(ctx) directly when a message
 //  starts with "/game". Returns true if handled (and replied to).
@@ -106,6 +107,29 @@ async function handleGameSwitchCommands(ctx) {
                 `Active: *${active ? `${active.config.GAME_NAME} (${active.config.GAME_ACRONYM})` : 'none loaded'}*\n` +
                 `Admin scope: *${settings.adminGameAccess === 'all' ? 'ALL games' : settings.adminGameAccess}*\n` +
                 `Available: *${registry.listGameKeys().join(', ') || 'none loaded'}*`
+        })
+        return true
+    }
+
+    // ── roletags on|off — bot-wide (Creator)/(Admin) name tag toggle ──
+    // Creator-only. Read by permissions.nameTag() so it applies
+    // identically across every game — one flag, one place, no per-game
+    // duplication or drift.
+    if (cmd[0] === 'roletags') {
+        if (!senderIsCreator) return false
+
+        const arg = (cmd[1] || '').toLowerCase()
+        if (arg !== 'on' && arg !== 'off') {
+            await sendSafeMessage(sock, replyTo, {
+                text: `Usage: \`/game roletags on\` or \`/game roletags off\`\nCurrently: *${settings.showRoleTags === false ? 'OFF' : 'ON'}*`
+            })
+            return true
+        }
+
+        settings.showRoleTags = (arg === 'on')
+        saveSettings()
+        await sendSafeMessage(sock, replyTo, {
+            text: `✅ Role tags (Creator)/(Admin) are now *${arg === 'on' ? 'ON' : 'OFF'}* — applies bot-wide, across every game.`
         })
         return true
     }

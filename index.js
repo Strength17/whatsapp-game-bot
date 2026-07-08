@@ -80,7 +80,8 @@ let settings = {
     publicVisible:    true,
     publicCanStart:   false,
     activeGame:       'hangman',   // which game module is currently live
-    adminGameAccess:  'all'        // which game(s) the confirmed admin may operate
+    adminGameAccess:  'all',       // which game(s) the confirmed admin may operate
+    showRoleTags:     true         // bot-wide (Creator)/(Admin) tag on nameTag(), see permissions.js
 }
 
 let pendingAdminChangeRef = { value: null }
@@ -92,6 +93,7 @@ if (fs.existsSync(SETTINGS_FILE)) {
     if (typeof settings.publicCanStart  === 'undefined') settings.publicCanStart  = false
     if (typeof settings.activeGame      === 'undefined') settings.activeGame      = 'hangman'
     if (typeof settings.adminGameAccess === 'undefined') settings.adminGameAccess = 'all'
+    if (typeof settings.showRoleTags    === 'undefined') settings.showRoleTags    = true
 }
 
 function saveSettings() {
@@ -512,7 +514,8 @@ async function startBot() {
                             `🎮 *Game Switcher*\n\n` +
                             `› \`/game setgame [key]\` — switch the active game\n` +
                             `› \`/game setadminaccess [key|all]\` — scope the admin to one game\n` +
-                            `› \`/game status\` — show what's active and what's available\n\n` +
+                            `› \`/game status\` — show what's active and what's available\n` +
+                            `› \`/game roletags on|off\` — toggle (Creator)/(Admin) tags bot-wide\n\n` +
                             `Available games: *${registry.listGameKeys().join(', ') || 'none loaded'}*`
                     })
                 }

@@ -2,11 +2,9 @@
 //  WordChainGame/matchSummary.js
 //  Builds the end-of-match report and updates the all-time
 //  bragging-rights stats file: longest single word ever played,
-//  longest chain ever reached, and each player's personal best
-//  word. Personal bests matter as much as the global record —
-//  per gamification research, rewarding a player for beating
-//  their OWN past performance keeps players of every skill level
-//  engaged, not just whoever's currently #1.
+//  longest chain ever reached, and each player's own personal-best
+//  word (a non-competitive progress signal alongside the leaderboard —
+//  see README.md "Engagement" for why both are worth keeping).
 // ============================================================
 
 const fs = require('fs')
@@ -22,39 +20,36 @@ function loadStats() {
     if (fs.existsSync(STATS_FILE)) {
         try { return JSON.parse(fs.readFileSync(STATS_FILE)) } catch (_) {}
     }
-    return { longestWord: '', longestWordBy: '', longestChain: 0, longestChainDate: '', players: {} }
+    return { longestWord: '', longestWordBy: '', longestChain: 0, longestChainDate: '', personalBests: {} }
 }
 
 function saveStats(stats) {
     try {
         fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2))
     } catch (err) {
-        console.log('[WordChain] Could not save stats file:', err && err.message)
+        console.error('[WordChain] failed to save stats file:', err)
     }
 }
 
 function updateStats(gameState) {
     const stats = loadStats()
-    if (!stats.players) stats.players = {}
+    if (!stats.personalBests) stats.personalBests = {}
 
-    let brokeWordRecord    = false
-    let brokeChainRecord   = false
-    let brokePersonalBest  = false
+    let brokeWordRecord = false
+    let brokeChainRecord = false
+    let brokePersonalBest = false
 
-    const bestWord   = gameState.longestWordThisMatch
-    const bestWordBy = gameState.longestWordThisMatchBy
-
-    if (bestWord && bestWord.length > (stats.longestWord || '').length) {
-        stats.longestWord   = bestWord
-        stats.longestWordBy = bestWordBy || ''
+    if (gameState.longestWordThisMatch && gameState.longestWordThisMatch.length > (stats.longestWord || '').length) {
+        stats.longestWord   = gameState.longestWordThisMatch
+        stats.longestWordBy = gameState.longestWordThisMatchBy || ''
         brokeWordRecord = true
     }
 
-    if (bestWord && bestWordBy) {
-        if (!stats.players[bestWordBy]) stats.players[bestWordBy] = { longestWord: '', longestWordLength: 0, matchesWon: 0 }
-        if (bestWord.length > stats.players[bestWordBy].longestWordLength) {
-            stats.players[bestWordBy].longestWord       = bestWord
-            stats.players[bestWordBy].longestWordLength = bestWord.length
+    if (gameState.longestWordThisMatch && gameState.longestWordThisMatchBy) {
+        const playerNumber = gameState.longestWordThisMatchBy
+        const prevBest = stats.personalBests[playerNumber]
+        if (!prevBest || gameState.longestWordThisMatch.length > prevBest.length) {
+            stats.personalBests[playerNumber] = gameState.longestWordThisMatch
             brokePersonalBest = true
         }
     }
@@ -70,15 +65,6 @@ function updateStats(gameState) {
     return { stats, brokeWordRecord, brokeChainRecord, brokePersonalBest }
 }
 
-function recordWin(winnerNumber) {
-    const stats = loadStats()
-    if (!stats.players) stats.players = {}
-    if (!stats.players[winnerNumber]) stats.players[winnerNumber] = { longestWord: '', longestWordLength: 0, matchesWon: 0 }
-    stats.players[winnerNumber].matchesWon = (stats.players[winnerNumber].matchesWon || 0) + 1
-    saveStats(stats)
-    return stats.players[winnerNumber].matchesWon
-}
-
 function recordStrikeOut(gameState, playerNumber) {
     if (!gameState.disqualified) gameState.disqualified = []
     gameState.disqualified.push({ playerNumber, reason: DQ_REASONS.STRIKES_OUT })
@@ -90,14 +76,8 @@ function checkLastPlayerStanding(gameState) {
 }
 
 // resultInfo = { type: 'winner' | 'solo_end' | 'admin_stop', winnerNumber? }
-// driftInfo (optional) = { changed, from, to, strikeRate } from gameEngine.driftTierForNextMatch
-async function sendMatchReport(sock, chatId, gameState, resultInfo, nameTagFn, driftInfo) {
+async function sendMatchReport(sock, chatId, gameState, resultInfo, nameTagFn) {
     const { stats, brokeWordRecord, brokeChainRecord, brokePersonalBest } = updateStats(gameState)
-
-    let winsTotal = null
-    if (resultInfo.type === 'winner' && resultInfo.winnerNumber) {
-        winsTotal = recordWin(resultInfo.winnerNumber)
-    }
 
     const chainWords = gameState.chain.map(c => c.word.toUpperCase()).join(' → ') || '(no words played)'
     const longestThisMatch = gameState.longestWordThisMatch
@@ -106,7 +86,7 @@ async function sendMatchReport(sock, chatId, gameState, resultInfo, nameTagFn, d
 
     let headline = ''
     if (resultInfo.type === 'winner') {
-        headline = `🏆 *${nameTagFn(resultInfo.winnerNumber)} wins Word Chain!*` + (winsTotal ? ` _(win #${winsTotal})_` : '')
+        headline = `🏆 *${nameTagFn(resultInfo.winnerNumber)} wins Word Chain!*`
     } else if (resultInfo.type === 'admin_stop') {
         headline = `🛑 *Word Chain ended by an admin.*`
     } else {
@@ -114,17 +94,10 @@ async function sendMatchReport(sock, chatId, gameState, resultInfo, nameTagFn, d
     }
 
     let recordsText = ''
-    if (brokeWordRecord)   recordsText += `\n🆕 *New all-time longest word!* ${stats.longestWord.toUpperCase()}`
-    if (brokeChainRecord)  recordsText += `\n🆕 *New all-time longest chain!* ${stats.longestChain} words`
+    if (brokeWordRecord) recordsText += `\n🆕 *New all-time longest word!* ${stats.longestWord.toUpperCase()}`
+    if (brokeChainRecord) recordsText += `\n🆕 *New all-time longest chain!* ${stats.longestChain} words`
     if (brokePersonalBest && gameState.longestWordThisMatchBy) {
-        recordsText += `\n⭐ *Personal best for ${nameTagFn(gameState.longestWordThisMatchBy)}!* ${gameState.longestWordThisMatch.toUpperCase()}`
-    }
-
-    let driftText = ''
-    if (driftInfo && driftInfo.changed) {
-        driftText = driftInfo.to > driftInfo.from
-            ? `\n\n📈 _Group's on fire — next match gets a little harder._`
-            : `\n\n📉 _That one was rough — next match eases up a bit._`
+        recordsText += `\n🌟 *${nameTagFn(gameState.longestWordThisMatchBy)} just beat their own personal best!*`
     }
 
     const report =
@@ -133,12 +106,9 @@ async function sendMatchReport(sock, chatId, gameState, resultInfo, nameTagFn, d
         `📏 *Longest word this match:* ${longestThisMatch}\n` +
         `🏛️ *All-time longest word:* ${stats.longestWord ? stats.longestWord.toUpperCase() : '—'}\n` +
         `🏛️ *All-time longest chain:* ${stats.longestChain || 0} words` +
-        recordsText +
-        driftText
+        recordsText
 
-    await sock.sendMessage(chatId, { text: report }).catch(err =>
-        console.log('[WordChain] Could not send match report:', err && err.message)
-    )
+    await sock.sendMessage(chatId, { text: report })
 }
 
 module.exports = {
@@ -146,7 +116,6 @@ module.exports = {
     loadStats,
     saveStats,
     updateStats,
-    recordWin,
     recordStrikeOut,
     checkLastPlayerStanding,
     sendMatchReport

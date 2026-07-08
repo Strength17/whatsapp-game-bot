@@ -107,9 +107,18 @@ function writeSetting(tier, key, value, settings) {
 /**
  * Returns a display tag using the person's name + role badge if applicable.
  * Never shows a number or JID.
+ *
+ * Role badges are gated by `settings.showRoleTags` — a bot-wide, unprefixed
+ * flag (defaults to true, preserving prior behavior). It lives here, not
+ * per-game, because every game module imports this same function; a
+ * per-game toggle would need duplicating in every config.js and would
+ * inevitably drift out of sync across games.
  */
 function nameTag(number, nameCache, settings) {
     const name = (nameCache && nameCache[number]) || 'Player'
+    const showTags = !settings || settings.showRoleTags !== false
+
+    if (!showTags) return name
 
     const creatorJid = process.env.CREATOR_JID || ''
     const creatorNum = creatorJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')

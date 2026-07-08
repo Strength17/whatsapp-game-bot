@@ -28,11 +28,16 @@ async function handlePublicMessage(msgCtx) {
         const rest = text.slice(config.PREFIX.length).trim().toLowerCase()
 
         // Bare "!tgt" with no subcommand must always explain the game —
-        // never silently attempt to start it. See ARCHITECTURE.md §10.
+        // never silently attempt to start it. See ARCHITECTURE.md §9.
+        // COMPLIANCE FIX: card-formatted per §A9/BOT_STYLE_GUIDE — HMG's
+        // own bare-prefix intro gets the divider/brand treatment, and this
+        // is exactly the "help dashboard" card type listed there.
         if (rest === '') {
             await sock.sendMessage(from, {
                 text:
-                    `🎯 *${config.GAME_NAME} (${config.GAME_ACRONYM})*\n\n` +
+                    `${config.DIVIDER}\n` +
+                    `${config.BOT_EMOJI} *${config.GAME_NAME} (${config.GAME_ACRONYM})*\n` +
+                    `${config.DIVIDER}\n\n` +
                     `Each round gives 6 numbers and a 3-digit target. Combine any of the ` +
                     `numbers (don't have to use them all, each only as many times as it appears) ` +
                     `with \`+ − × ÷\` — every step must stay a positive whole number, no fractions. ` +
@@ -41,7 +46,9 @@ async function handlePublicMessage(msgCtx) {
                     `*${config.PREFIX} start* — begin a session\n` +
                     `*${config.PREFIX} scores* — show current standings\n` +
                     `*${config.PREFIX} hint* — get a partial hint for the live round\n` +
-                    `*${config.PREFIX} help* — show this again`
+                    `*${config.PREFIX} help* — show this again\n\n` +
+                    `${config.DIVIDER}\n` +
+                    `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
             })
             return true
         }
@@ -80,10 +87,9 @@ async function handlePublicMessage(msgCtx) {
 
         if (rest === 'scores' || rest === 'leaderboard') {
             const gameState = gameEngine.getGameState(from, games)
-            const text2 = matchSummary.buildLeaderboardText(
+            const text2 = matchSummary.buildLiveStandingsText(
                 gameState,
-                (n) => nameTag(n, gameState.playerNames, settings),
-                gameState.active ? 'in_progress' : 'manual'
+                (n) => nameTag(n, gameState.playerNames, settings)
             )
             await sock.sendMessage(from, { text: text2 })
             return true
@@ -92,7 +98,9 @@ async function handlePublicMessage(msgCtx) {
         if (rest === 'help') {
             await sock.sendMessage(from, {
                 text:
-                    `🎯 *${config.GAME_NAME} (${config.GAME_ACRONYM}) — How to Play*\n\n` +
+                    `${config.DIVIDER}\n` +
+                    `${config.BOT_EMOJI} *${config.GAME_NAME} (${config.GAME_ACRONYM}) — How to Play*\n` +
+                    `${config.DIVIDER}\n\n` +
                     `*${config.PREFIX} start* — begin a session\n` +
                     `*${config.PREFIX} scores* — show current standings\n` +
                     `*${config.PREFIX} hint* — get a partial hint for the live round\n` +
@@ -101,7 +109,9 @@ async function handlePublicMessage(msgCtx) {
                     `numbers (don't have to use them all, each only as many times as it appears) ` +
                     `with \`+ − × ÷\` — every step must stay a positive whole number, no fractions. ` +
                     `Just type your equation while a round is open. Exact hit ends the round instantly; ` +
-                    `otherwise the closest submission wins when time's up!`
+                    `otherwise the closest submission wins when time's up!\n\n` +
+                    `${config.DIVIDER}\n` +
+                    `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
             })
             return true
         }

@@ -2,54 +2,76 @@
 //  WordChainGame/publicCommands.js
 //  Handles all "!wcg ..." public messages plus in-round plain-
 //  text word submissions. Exports handlePublicMessage(msgCtx)
-//  per the plugin contract. Player surface is intentionally
-//  limited to view/start/join/help/hint — see root
-//  COMMAND_CONTROL.md; everything that controls or ends a match
-//  (pause/resume/stop/reset/config) is admin-only.
+//  per the plugin contract (ARCHITECTURE.md).
+//
+//  Per ARCHITECTURE.md §5, the public self-service "claim the
+//  admin role" command lives HERE, not in adminCommands.js — it's
+//  the one command any random group member is allowed to run
+//  before any tier gate applies.
 // ============================================================
 
 const { nameTag } = require('../permissions')
-const { PREFIX, ADMIN_PREFIX } = require('./config')
+const { PREFIX } = require('./config')
+const { card, themeBadge } = require('./display')
 const {
     getGameState,
-    startLobbyCountdown,
+    openLobby,
     processWordSubmission,
-    getHint,
-    tierConfigFor
+    themeWordsFor
 } = require('./gameEngine')
-const { difficultyBadge } = require('./display')
+const dictionary = require('./dictionary')
 
 /**
  * @param {object} msgCtx {
  *   sock, games, settings, words, activeGameChatRef, persistGames, nameCache,
- *   sendSafeMessage, buildCtx,
+ *   sendSafeMessage, buildCtx, saveSettings,
  *   from, body, rawBody, senderNumber, senderJid, senderName, isAdmin
  * }
  * @returns {boolean} true if this message was handled by Word Chain
  */
 async function handlePublicMessage(msgCtx) {
     const {
-        sock, games, settings, activeGameChatRef, persistGames,
+        sock, games, settings, activeGameChatRef, persistGames, nameCache, saveSettings,
         buildCtx, from, body, senderNumber, senderJid, senderName
     } = msgCtx
 
     const bodyLower = (body || '').trim().toLowerCase()
     const ctx = buildCtx ? buildCtx() : msgCtx
 
-    // ── !wcg / !wcg help — rules. Bare acronym is its OWN branch, checked
-    // before 'start', and never stateful — see ARCHITECTURE.md §9.
+    // ── !wcg / !wcg help — bare acronym must ALWAYS explain, never act
+    // (ARCHITECTURE.md §9 — checked first, before every other branch) ──
     if (bodyLower === PREFIX || bodyLower === `${PREFIX} help`) {
         await sock.sendMessage(from, {
-            text:
-                `🔗 *Word Chain!*\n\n` +
+            text: card('Word Chain!',
                 `Say a real word. Next player's word must start with YOUR word's last letter. No repeats. ` +
                 `Miss, stall, or break a rule enough times and you're out — last one standing wins!\n\n` +
-                `*${PREFIX} start* — open a lobby\n` +
-                `*${PREFIX} join* — join it\n` +
-                `*${PREFIX} scores* — check the chain, whose turn it is, strikes so far\n` +
-                `*${PREFIX} hint* — get a nudge on your turn (once per turn)\n` +
-                `_Difficulty adjusts to this group automatically — no setup needed._\n` +
-                `_Created with ❤️ by Sky Graphics_ 🎨`
+                `📏 Minimum word length climbs *live* the longer a chain runs, and starts a little higher ` +
+                `each match your group cruises through the last one.\n` +
+                `🎨 Themed words (Animals, Food) unlock automatically the longer the group goes without a strike.\n` +
+                `⏳ Every match runs on its own clock — it ends itself, no admin has to stop it, and a fresh lobby ` +
+                `opens right after.\n\n` +
+                `1️⃣ *${PREFIX} start* — open a lobby\n` +
+                `2️⃣ *${PREFIX} join* — join it\n` +
+                `3️⃣ *${PREFIX} scores* — see the chain, whose turn it is, and current strikes\n` +
+                `4️⃣ *${PREFIX} hint* — get a small nudge on your turn\n` +
+                `5️⃣ *${PREFIX} admin* — claim the admin role (if unclaimed)`)
+        })
+        return true
+    }
+
+    // ── !wcg admin — public self-claim, unclaimed-only ──
+    if (bodyLower === `${PREFIX} admin`) {
+        if (settings.adminNumber) {
+            await sock.sendMessage(from, {
+                text: `⚠️ An admin is already set. Ask the Creator to run */wcg clearadmin* first if this needs to change.`
+            })
+            return true
+        }
+        settings.adminNumber = senderNumber
+        settings.adminJid    = senderJid
+        saveSettings()
+        await sock.sendMessage(from, {
+            text: `👑 *You're now the Word Chain Admin!*\nType */wcg help* to see everything you can configure.`
         })
         return true
     }
@@ -58,30 +80,11 @@ async function handlePublicMessage(msgCtx) {
     if (bodyLower === `${PREFIX} start`) {
         if (activeGameChatRef.value) {
             await sock.sendMessage(from, {
-                text: `⚠️ A game is already active${activeGameChatRef.value === from ? ' in this chat' : ' elsewhere'}. Ask an admin to run */wcg stop* first.`
+                text: `⚠️ A game is already active${activeGameChatRef.value === from ? ' in this chat' : ' elsewhere'}. Use */wcg end* to stop it first.`
             })
             return true
         }
-        const gameState = getGameState(from, games)
-        gameState.lobbyActive = true
-        gameState.lobbySecondsLeft = 60
-        gameState.players = []
-        gameState.playerNames = {}
-        gameState.playerJids = {}
-
-        const tierKey = tierConfigFor(gameState.tier).tierKey
-
-        await sock.sendMessage(from, {
-            text:
-                `🔗 *Word Chain is Starting!*\n\n` +
-                `You have *60 seconds* to join! ⏱️\n` +
-                `🎯 Mode: ${difficultyBadge(tierKey)} _(auto)_\n` +
-                `Type *${PREFIX} join* now!`
-        })
-
-        activeGameChatRef.value = from
-        persistGames()
-        startLobbyCountdown(from, ctx)
+        await openLobby(from, ctx)
         return true
     }
 
@@ -112,59 +115,61 @@ async function handlePublicMessage(msgCtx) {
         return true
     }
 
-    // ── !wcg scores — read-only view, always available (COMMAND_CONTROL.md) ──
-    if (bodyLower === `${PREFIX} scores` || bodyLower === `${PREFIX} status`) {
+    // ── !wcg scores — public "view" command: chain, turn, strikes ──
+    if (bodyLower === `${PREFIX} scores`) {
         const gameState = getGameState(from, games)
-        if (gameState.lobbyActive) {
-            const lobbyText = gameState.players
-                .map((num, i) => `${i + 1}. ${nameTag(num, gameState.playerNames, settings)}`)
-                .join('\n') || '[No players yet]'
-            await sock.sendMessage(from, {
-                text: `⏳ *Lobby open* — ${gameState.lobbySecondsLeft}s left.\n👥 *Players:*\n${lobbyText}`
-            })
-            return true
-        }
         if (!gameState.active) {
-            await sock.sendMessage(from, { text: `ℹ️ No *Word Chain* game is running here right now. Type *${PREFIX} start* to open one!` })
+            await sock.sendMessage(from, { text: `⚠️ No round is active right now. Type *${PREFIX} start* to open a lobby!` })
             return true
         }
         const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
-        const currentStrikes = gameState.strikes[currentPlayerNumber] || 0
-        const lastWord = gameState.chain.length ? gameState.chain[gameState.chain.length - 1].word : null
+        const currentPlayerName   = nameTag(currentPlayerNumber, gameState.playerNames, settings)
+        const currentStrikes      = gameState.strikes[currentPlayerNumber] || 0
+        const chainWords = gameState.chain.map(c => c.word.toUpperCase()).join(' → ') || '(empty so far)'
+        const themeLine = themeBadge(gameState.roundTheme)
+        const matchMin = Math.floor((gameState.matchSecondsLeft || 0) / 60)
+        const matchSec = String((gameState.matchSecondsLeft || 0) % 60).padStart(2, '0')
+
         await sock.sendMessage(from, {
             text:
-                `📊 *Word Chain — Live Standings*\n\n` +
-                `🔗 Chain length: *${gameState.chain.length}* words\n` +
-                (lastWord ? `Last word: *${lastWord.toUpperCase()}* → next starts with *${lastWord.slice(-1).toUpperCase()}*\n` : '') +
-                `🎯 Current turn: *${nameTag(currentPlayerNumber, gameState.playerNames, settings)}* (${currentStrikes}/${gameState.roundMaxStrikes} strikes)\n` +
-                `👥 Players remaining: ${gameState.players.length}\n` +
-                `📏 Longest word this match: ${gameState.longestWordThisMatch ? gameState.longestWordThisMatch.toUpperCase() : '—'}`
+                `📊 *Word Chain — ${gameState.chain.length} words so far*\n` +
+                `${chainWords}\n\n` +
+                (themeLine ? `${themeLine}\n` : ``) +
+                `🎯 Current turn: *${currentPlayerName}*\n` +
+                `💥 Strikes: *${currentStrikes}/${gameState.roundMaxStrikes}*\n` +
+                `⏱️ ${gameState.turnSecondsLeft}s left on this turn\n` +
+                `⏳ ${matchMin}:${matchSec} left in the match`
         })
         return true
     }
 
-    // ── !wcg hint — player-facing, once per turn, fragment only ──
+    // ── !wcg hint — fragment, not the answer, same rule as other games ──
     if (bodyLower === `${PREFIX} hint`) {
         const gameState = getGameState(from, games)
+        if (!gameState.active) {
+            await sock.sendMessage(from, { text: `⚠️ No round is active right now.` })
+            return true
+        }
         const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
-        if (!gameState.active || gameState.paused) {
-            await sock.sendMessage(from, { text: `ℹ️ No live round to hint right now.` })
-            return true
-        }
         if (senderNumber !== currentPlayerNumber) {
-            await sock.sendMessage(from, { text: `⚠️ Hints are only for whoever's turn it is right now.` })
+            await sock.sendMessage(from, { text: `⚠️ Hints are only for whoever's turn it currently is.` })
             return true
         }
-        const result = getHint(from, ctx)
-        if (!result.ok) {
-            const msg = result.reason === 'already_given'
-                ? `💡 You already used your hint this turn!`
-                : `💡 No hint available right now — you've got this!`
-            await sock.sendMessage(from, { text: msg })
+        const lastEntry = gameState.chain.length ? gameState.chain[gameState.chain.length - 1] : null
+        const requiredLetter = lastEntry ? lastEntry.word.slice(-1) : null
+
+        if (!requiredLetter) {
+            await sock.sendMessage(from, { text: `💡 It's the opening word — any real word, ${gameState.roundMinLength}+ letters, goes!` })
             return true
         }
+
+        const themeWords = themeWordsFor(msgCtx.words, gameState.roundTheme)
+        const fragment = dictionary.getHintFragment(requiredLetter, gameState.roundMinLength, gameState.usedWords, themeWords)
+
         await sock.sendMessage(from, {
-            text: `💡 *Hint:* there's a *${result.length}-letter* word starting with *"${result.prefix}..."* that works.`
+            text: fragment
+                ? `💡 *Hint:* a valid word starts with "*${fragment.toUpperCase()}...*"`
+                : `💡 Nothing left comes to mind for *${requiredLetter.toUpperCase()}* that hasn't been used — you're on your own for this one! 😅`
         })
         return true
     }
@@ -172,9 +177,7 @@ async function handlePublicMessage(msgCtx) {
     // Any other unmatched "!wcg ..." input is a mistyped command, never a
     // word — don't let it fall through to word validation and cost a strike.
     if (bodyLower.startsWith(PREFIX)) {
-        await sock.sendMessage(from, {
-            text: `❓ Unknown command. Type *${PREFIX}* for the rules, *${PREFIX} start*, *${PREFIX} join*, *${PREFIX} scores*, or *${PREFIX} hint*.`
-        })
+        await sock.sendMessage(from, { text: `❓ Unknown command. Type *${PREFIX}* for the rules, *${PREFIX} start*, *${PREFIX} join*, *${PREFIX} scores*, or *${PREFIX} hint*.` })
         return true
     }
 

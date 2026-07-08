@@ -18,21 +18,13 @@ const wordListRaw = require('word-list')
 const wordListPath = (typeof wordListRaw === 'string') ? wordListRaw : wordListRaw.default
 
 let wordSet = null
-let byFirstLetter = null // { [letter]: string[] } — built once, used by findHintCandidate
 
 function loadDictionary() {
     if (wordSet) return wordSet
     const raw = fs.readFileSync(wordListPath, 'utf8')
-    const words = raw.split('\n').map(w => w.trim().toLowerCase()).filter(Boolean)
-    wordSet = new Set(words)
-
-    byFirstLetter = {}
-    for (const w of words) {
-        const letter = w[0]
-        if (!byFirstLetter[letter]) byFirstLetter[letter] = []
-        byFirstLetter[letter].push(w)
-    }
-
+    wordSet = new Set(
+        raw.split('\n').map(w => w.trim().toLowerCase()).filter(Boolean)
+    )
     console.log(`📖 Word Chain dictionary loaded: ${wordSet.size} words`)
     return wordSet
 }
@@ -45,6 +37,41 @@ function isRealWord(word) {
 
 function dictionarySize() {
     return loadDictionary().size
+}
+
+// ─── Hint support ───────────────────────────────────────────────
+// Lazily built once, on first hint request — an index of words by
+// first letter so !wcg hint doesn't scan the full ~370k-word set
+// every time it's asked.
+let byFirstLetter = null
+
+function buildFirstLetterIndex() {
+    if (byFirstLetter) return byFirstLetter
+    byFirstLetter = {}
+    for (const w of loadDictionary()) {
+        const c = w[0]
+        if (!byFirstLetter[c]) byFirstLetter[c] = []
+        byFirstLetter[c].push(w)
+    }
+    return byFirstLetter
+}
+
+/**
+ * Returns just the first two letters of ONE valid candidate word — never
+ * the full word — so a hint nudges without solving the turn outright.
+ * @returns {string|null} e.g. "ap" for "apple", or null if nothing fits
+ */
+function getHintFragment(letter, minLength, usedWords, themeWords) {
+    const index = buildFirstLetterIndex()
+    const pool = (index[letter] || []).filter(w =>
+        w.length >= minLength && !usedWords.includes(w)
+    )
+    const combined = pool.concat((themeWords || []).filter(w =>
+        w[0] === letter && w.length >= minLength && !usedWords.includes(w)
+    ))
+    if (combined.length === 0) return null
+    const pick = combined[Math.floor(Math.random() * combined.length)]
+    return pick.slice(0, 2)
 }
 
 /**
@@ -64,47 +91,4 @@ function isAcceptedWord(word, themeWords) {
     return false
 }
 
-/**
- * Finds one valid, not-yet-used candidate word for a hint — starting
- * with `requiredLetter`, at least `minLength` letters, real dictionary
- * word or theme word. Returns a random pick among matches (capped scan)
- * so hints aren't always the same word, or null if nothing qualifies.
- * The CALLER only ever reveals a short prefix of this, never the whole
- * thing — see gameEngine.js getHint().
- */
-function findHintCandidate(requiredLetter, minLength, usedWords, themeWords) {
-    loadDictionary()
-    const usedSet = new Set(usedWords || [])
-    const pool = []
-
-    if (requiredLetter) {
-        const bucket = byFirstLetter[requiredLetter] || []
-        for (const w of bucket) {
-            if (w.length >= minLength && !usedSet.has(w)) {
-                pool.push(w)
-                if (pool.length >= 25) break // cap the scan, we only need variety, not completeness
-            }
-        }
-        if (themeWords) {
-            for (const w of themeWords) {
-                if (w[0] === requiredLetter && w.length >= minLength && !usedSet.has(w)) pool.push(w)
-            }
-        }
-    } else {
-        // First word of the chain — no required letter yet, just anything valid.
-        for (const letter of Object.keys(byFirstLetter)) {
-            for (const w of byFirstLetter[letter]) {
-                if (w.length >= minLength && !usedSet.has(w)) {
-                    pool.push(w)
-                    break
-                }
-            }
-            if (pool.length >= 25) break
-        }
-    }
-
-    if (pool.length === 0) return null
-    return pool[Math.floor(Math.random() * pool.length)]
-}
-
-module.exports = { loadDictionary, isRealWord, dictionarySize, isAcceptedWord, findHintCandidate }
+module.exports = { loadDictionary, isRealWord, dictionarySize, isAcceptedWord, getHintFragment }

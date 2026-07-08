@@ -1,46 +1,98 @@
 // ============================================================
 //  WordChainGame/gameEngine.js
 //  Pure game-state logic: lobby, turn rotation, word validation,
-//  strikes, elimination, adaptive theme-aware acceptance, and
-//  automatic per-chat difficulty drift. No admin logic, no
-//  command-string parsing here — that lives in adminCommands.js /
-//  publicCommands.js.
+//  strikes, elimination, LIVE in-match difficulty progression,
+//  auto-rotating themes, a self-governing match-duration clock,
+//  and the once-per-match auto-tier drift that carries into the
+//  NEXT match. No admin logic, no command-string parsing — that
+//  lives in adminCommands.js / publicCommands.js.
 // ============================================================
 
 const matchSummary = require('./matchSummary')
 const dictionary   = require('./dictionary')
 const { nameTag, resolveSetting } = require('../permissions')
-const { difficultyBadge, themeBadge } = require('./display')
+const { difficultyBadge, themeBadge, card } = require('./display')
 const {
-    GAME_KEY, TIERS, TIER_CONFIG, MIN_TIER, MAX_TIER, START_TIER,
-    MIN_TIMER_SECONDS, STRIKE_RATE_EASIER_ABOVE, STRIKE_RATE_HARDER_BELOW,
+    GAME_KEY, TIER_NAMES, TIER_TABLE, MAX_TIER,
+    DRIFT_STRUGGLE_STRIKE_RATE, DRIFT_CRUISE_STRIKE_RATE,
+    PROGRESSION_STEPS, MAX_MIN_LENGTH, MIN_TIMER_SECONDS,
+    THEME_ROTATION_ORDER, THEME_ROTATION_QUALIFY,
+    MATCH_DURATION_SECONDS, MIN_MATCH_DURATION_SECONDS, MAX_MATCH_DURATION_SECONDS,
+    AUTO_RESTART_COOLDOWN_SECONDS,
     CHAIN_MILESTONES, LOBBY_SECONDS, PREFIX
 } = require('./config')
 const { DEFAULT_WORDS } = require('./themeBank')
 
-// ─── Tier resolution (fully automatic — see README "Adaptive difficulty") ──
-function tierConfigFor(tierIndex) {
-    const key = TIERS[tierIndex] || TIERS[START_TIER]
-    const base = TIER_CONFIG[key] || TIER_CONFIG.easy
-    return {
-        tierKey: key,
-        minLength: base.minLength,
-        timerSeconds: Math.max(MIN_TIMER_SECONDS, base.timerSeconds),
-        maxStrikes: base.maxStrikes
+// A send that can never take down a timer callback with it. setInterval/
+// setTimeout bodies aren't covered by index.js's per-message try/catch,
+// so every send from inside one is wrapped here (ARCHITECTURE.md §6/§8).
+async function safeSend(sock, jid, payload) {
+    try {
+        await sock.sendMessage(jid, payload)
+    } catch (err) {
+        console.log(`[WordChain] sendMessage failed for ${jid}:`, err && err.message)
     }
 }
 
-// Returns the lowercase word list for the currently active theme, or [].
-function activeThemeWords(words) {
-    const active = (words && words.activeTheme) || 'none'
-    if (active === 'none') return []
-    const list = words.themes && words.themes[active]
+// ─── Tier → starting round config for a match ──────────────────────
+function roundConfigForTier(tier) {
+    const clamped = Math.max(0, Math.min(MAX_TIER, tier || 0))
+    return { tierIndex: clamped, tierName: TIER_NAMES[clamped], ...TIER_TABLE[clamped] }
+}
+
+// ─── Live in-match progression ──────────────────────────────────────
+// Finds the highest atChainLength threshold the current chain has
+// reached and applies THAT step's deltas on top of the match's
+// starting (tier) config — steps replace, not stack, so this can
+// never runaway compound. Strikes never tighten mid-match on purpose.
+function progressionConfigForChain(baseCfg, chainLength) {
+    let minLength    = baseCfg.minLength
+    let timerSeconds = baseCfg.timerSeconds
+    for (const step of PROGRESSION_STEPS) {
+        if (chainLength >= step.atChainLength) {
+            minLength    = baseCfg.minLength    + step.minLengthDelta
+            timerSeconds = baseCfg.timerSeconds  + step.timerDelta
+        }
+    }
+    minLength    = Math.min(minLength, MAX_MIN_LENGTH)
+    timerSeconds = Math.max(timerSeconds, MIN_TIMER_SECONDS)
+    return { minLength, timerSeconds }
+}
+
+async function applyProgression(chatId, gameState, ctx) {
+    const baseCfg = roundConfigForTier(gameState.tier)
+    const prog = progressionConfigForChain(baseCfg, gameState.chain.length)
+    const grew = prog.minLength > gameState.roundMinLength
+    gameState.roundMinLength    = prog.minLength
+    gameState.roundTimerSeconds = prog.timerSeconds
+    if (grew) {
+        await safeSend(ctx.sock, chatId, {
+            text: `📏 *Chain's heating up!* Minimum word length is now *${prog.minLength}+ letters*.`
+        })
+    }
+}
+
+// ─── Auto theme rotation — qualification-gated, never timed, never admin-set ──
+function themeWordsFor(words, themeKey) {
+    if (!themeKey || themeKey === 'none') return []
+    const list = words && words.themes && words.themes[themeKey]
     return Array.isArray(list) ? list.map(w => w.toLowerCase()) : []
+}
+
+async function maybeRotateTheme(chatId, gameState, ctx) {
+    if (gameState.wordsSinceStrike < THEME_ROTATION_QUALIFY) return
+    gameState.wordsSinceStrike = 0
+    gameState.themeRotationIndex = (gameState.themeRotationIndex + 1) % THEME_ROTATION_ORDER.length
+    gameState.roundTheme = THEME_ROTATION_ORDER[gameState.themeRotationIndex]
+    const badge = themeBadge(gameState.roundTheme)
+    await safeSend(ctx.sock, chatId, {
+        text: `🎨 *Theme shift!* ${badge} words are now also accepted, on top of regular words.`
+    })
 }
 
 // ─── getGameState ───────────────────────────────────────────────
 // State is stored under a GAME_KEY-prefixed key (not the bare chatId) —
-// the `games` object is shared across every game module.
+// `games` is shared across every game module (ARCHITECTURE.md §4).
 function stateKey(chatId) {
     return `${GAME_KEY}:${chatId}`
 }
@@ -55,6 +107,9 @@ function getGameState(chatId, games) {
             lobbySecondsLeft:  LOBBY_SECONDS,
             turnTimer:         null,
             turnSecondsLeft:   30,
+            matchTimer:        null,
+            matchSecondsLeft:  0,
+            matchDurationSeconds: MATCH_DURATION_SECONDS,
             players:           [],
             playerNames:       {},
             playerJids:        {},
@@ -63,129 +118,167 @@ function getGameState(chatId, games) {
             usedWords:         [],
             currentTurnIndex:  0,
             paused:            false,
+            tier:              0,     // persists across matches in this chat — the auto-drift memory
             roundMinLength:    3,
             roundTimerSeconds: 30,
-            roundMaxStrikes:   TIER_CONFIG.easy.maxStrikes,
+            roundMaxStrikes:   4,
             roundTheme:        'none',
-            longestWordThisMatch:   '',
+            wordsSinceStrike:  0,
+            themeRotationIndex: -1,
+            wordsPlayedByPlayer:    {},
+            strikesTotalByPlayer:   {},
+            longestWordThisMatch:    '',
             longestWordThisMatchBy: '',
-            hintGivenThisTurn: false,
-            nextMilestoneIndex: 0,
-            // Adaptive difficulty — persists across matches in this chat so
-            // each group settles at its own level over time. Only reset by
-            // an explicit /wcg reset, never by a normal match ending.
-            tier: START_TIER,
-            totalStrikesThisMatch: 0,
-            totalTurnsThisMatch: 0
+            totalStrikesThisMatch:  0,
+            totalTurnsThisMatch:    0,
+            milestonesHit:          []
         }
     }
-    if (!games[key].strikes)    games[key].strikes    = {}
-    if (!games[key].chain)      games[key].chain      = []
-    if (!games[key].usedWords)  games[key].usedWords  = []
-    if (!games[key].playerJids) games[key].playerJids = {}
-    if (!Number.isInteger(games[key].tier)) games[key].tier = START_TIER
-    return games[key]
+    const gs = games[key]
+    if (!gs.strikes)      gs.strikes      = {}
+    if (!gs.chain)        gs.chain        = []
+    if (!gs.usedWords)    gs.usedWords    = []
+    if (!gs.playerJids)   gs.playerJids   = {}
+    if (typeof gs.tier !== 'number') gs.tier = 0
+    if (!Array.isArray(gs.milestonesHit)) gs.milestonesHit = []
+    if (typeof gs.wordsSinceStrike !== 'number') gs.wordsSinceStrike = 0
+    if (typeof gs.themeRotationIndex !== 'number') gs.themeRotationIndex = -1
+    if (!gs.wordsPlayedByPlayer)  gs.wordsPlayedByPlayer  = {}
+    if (!gs.strikesTotalByPlayer) gs.strikesTotalByPlayer = {}
+    if (typeof gs.matchDurationSeconds !== 'number') gs.matchDurationSeconds = MATCH_DURATION_SECONDS
+    if (typeof gs.matchSecondsLeft !== 'number') gs.matchSecondsLeft = 0
+    return gs
 }
 
-function safeClearActiveRef(activeGameChatRef, chatId) {
-    if (activeGameChatRef.value === chatId) activeGameChatRef.value = null
+// ─── Admin-tunable match duration (dynamic default, admin-settable) ──
+function matchDurationSecondsFor(settings) {
+    const raw = resolveSetting(`${GAME_KEY}_matchDurationSeconds`, settings, MATCH_DURATION_SECONDS)
+    const n = Number(raw)
+    if (!Number.isFinite(n) || n <= 0) return MATCH_DURATION_SECONDS
+    return Math.max(MIN_MATCH_DURATION_SECONDS, Math.min(MAX_MATCH_DURATION_SECONDS, Math.round(n)))
+}
+
+// ─── Lobby open — used by both the public !wcg start command AND the
+// engine's own auto-restart after a match ends, so a fresh lobby opens
+// on autopilot with zero admin involvement. ─────────────────────────
+async function openLobby(chatId, ctx, opts = {}) {
+    const { sock, games, activeGameChatRef, persistGames } = ctx
+    if (activeGameChatRef.value && activeGameChatRef.value !== chatId) return false
+
+    const gameState = getGameState(chatId, games)
+    gameState.lobbyActive      = true
+    gameState.lobbySecondsLeft = LOBBY_SECONDS
+    gameState.players          = []
+    gameState.playerNames      = {}
+    gameState.playerJids       = {}
+    activeGameChatRef.value    = chatId
+    persistGames()
+
+    const introBody =
+        (opts.auto ? `That match is done — a fresh one is opening automatically! 🔁\n\n` : ``) +
+        `You have *${LOBBY_SECONDS} seconds* to join! ⏱️\n` +
+        `Type *${PREFIX} join* now!`
+
+    await safeSend(sock, chatId, { text: card('Word Chain is Starting!', introBody) })
+    startLobbyCountdown(chatId, ctx)
+    return true
 }
 
 // ─── Lobby countdown ─────────────────────────────────────────────
 function startLobbyCountdown(chatId, ctx) {
-    const { sock, games, settings, persistGames } = ctx
+    const { sock, games, persistGames } = ctx
     const gameState = getGameState(chatId, games)
     if (gameState.lobbyTimer) clearInterval(gameState.lobbyTimer)
 
     gameState.lobbyTimer = setInterval(async () => {
-        try {
-            if (!gameState.lobbyActive) {
-                clearInterval(gameState.lobbyTimer)
-                return
-            }
-
-            gameState.lobbySecondsLeft--
-
-            if (gameState.lobbySecondsLeft <= 0) {
-                clearInterval(gameState.lobbyTimer)
-                await startActualGame(chatId, ctx)
-            } else if (gameState.lobbySecondsLeft % 10 === 0) {
-                const tierKey = tierConfigFor(gameState.tier).tierKey
-                const lobbyMentions = gameState.players.map(num => gameState.playerJids[num]).filter(Boolean)
-                const lobbyText = gameState.players
-                    .map((num, i) => `${i + 1}. ${nameTag(num, gameState.playerNames, settings)}`)
-                    .join('\n')
-
-                await sock.sendMessage(chatId, {
-                    text:
-                        `⏱️ *Word Chain Lobby — Hurry Up!*\n` +
-                        `*${gameState.lobbySecondsLeft} seconds* left to join! Type *${PREFIX} join* now.\n` +
-                        `🎯 Mode: ${difficultyBadge(tierKey)} _(auto — adjusts to this group over time)_\n\n` +
-                        `👥 *Current Lobby:*\n${lobbyText || '[No players yet — be first! 🎯]'}`,
-                    mentions: lobbyMentions
-                })
-            }
-            persistGames()
-        } catch (err) {
-            console.error('[WordChain] lobby timer error:', err)
+        if (!gameState.lobbyActive) {
             clearInterval(gameState.lobbyTimer)
+            return
         }
+
+        gameState.lobbySecondsLeft--
+
+        if (gameState.lobbySecondsLeft <= 0) {
+            clearInterval(gameState.lobbyTimer)
+            await startActualGame(chatId, ctx)
+        } else if (gameState.lobbySecondsLeft % 10 === 0) {
+            const cfg = roundConfigForTier(gameState.tier)
+            const lobbyMentions = gameState.players.map(num => gameState.playerJids[num]).filter(Boolean)
+            const lobbyText = gameState.players
+                .map((num, i) => `${i + 1}. ${nameTag(num, gameState.playerNames, ctx.settings)}`)
+                .join('\n')
+
+            await safeSend(sock, chatId, {
+                text:
+                    `⏱️ *Word Chain Lobby — Hurry Up!*\n` +
+                    `*${gameState.lobbySecondsLeft} seconds* left to join! Type *${PREFIX} join* now.\n` +
+                    `🎯 Starting mode: ${difficultyBadge(cfg.tierName)} _(auto — climbs live as the chain grows)_\n\n` +
+                    `👥 *Current Lobby:*\n${lobbyText || '[No players yet — be first! 🎯]'}`,
+                mentions: lobbyMentions
+            })
+        }
+        persistGames()
     }, 1000)
 }
 
 // ─── Start actual game ────────────────────────────────────────────
 async function startActualGame(chatId, ctx) {
-    const { sock, games, settings, words, activeGameChatRef, persistGames } = ctx
+    const { sock, games, settings, activeGameChatRef, persistGames } = ctx
     const gameState = getGameState(chatId, games)
     gameState.lobbyActive = false
     if (gameState.lobbyTimer) clearInterval(gameState.lobbyTimer)
 
     if (gameState.players.length === 0) {
         gameState.active = false
-        safeClearActiveRef(activeGameChatRef, chatId)
+        if (activeGameChatRef.value === chatId) activeGameChatRef.value = null
         persistGames()
-        return await sock.sendMessage(chatId, {
+        return safeSend(sock, chatId, {
             text: `🚫 *Word Chain Cancelled*\nNo one joined the lobby in time. Type *${PREFIX} start* to open a fresh lobby! 🎮`
         })
     }
 
-    const cfg = tierConfigFor(gameState.tier)
+    const cfg = roundConfigForTier(gameState.tier)
     gameState.roundMinLength    = cfg.minLength
     gameState.roundTimerSeconds = cfg.timerSeconds
     gameState.roundMaxStrikes   = cfg.maxStrikes
-    gameState.roundTheme        = (words && words.activeTheme) || 'none'
+    gameState.roundTheme        = 'none'          // themes always start off — earned live via rotation
+    gameState.wordsSinceStrike  = 0
+    gameState.themeRotationIndex = -1
     gameState.chain             = []
     gameState.usedWords         = []
     gameState.strikes           = {}
     gameState.currentTurnIndex  = 0
     gameState.active            = true
     gameState.paused            = false
-    gameState.longestWordThisMatch   = ''
-    gameState.longestWordThisMatchBy = ''
-    gameState.hintGivenThisTurn = false
-    gameState.nextMilestoneIndex = 0
-    gameState.totalStrikesThisMatch = 0
-    gameState.totalTurnsThisMatch = 0
+    gameState.longestWordThisMatch    = ''
+    gameState.longestWordThisMatchBy  = ''
+    gameState.totalStrikesThisMatch   = 0
+    gameState.totalTurnsThisMatch     = 0
+    gameState.milestonesHit           = []
+    gameState.wordsPlayedByPlayer     = {}
+    gameState.strikesTotalByPlayer    = {}
+    gameState.matchDurationSeconds    = matchDurationSecondsFor(settings)
+    gameState.matchSecondsLeft        = gameState.matchDurationSeconds
 
     const openerNumber = gameState.players[0]
     const openerJid    = gameState.playerJids[openerNumber]
-    const themeLine    = themeBadge(gameState.roundTheme)
+    const minutesLabel = Math.round(gameState.matchDurationSeconds / 60 * 10) / 10
 
-    await sock.sendMessage(chatId, {
-        text:
-            `🎬 *Lobby Closed — Word Chain is ON!*\n\n` +
-            `🎯 *Mode:* ${difficultyBadge(cfg.tierKey)} _(auto)_ — words must be *${cfg.minLength}+ letters*\n` +
-            (themeLine ? `${themeLine} — themed words are also accepted, on top of regular English words\n` : ``) +
-            `⏱️ *${cfg.timerSeconds}s per turn* | 💥 *${cfg.maxStrikes} strikes* and you're out\n\n` +
+    await safeSend(sock, chatId, {
+        text: card('Lobby Closed — Word Chain is ON!',
+            `🎯 *Mode:* ${difficultyBadge(cfg.tierName)} _(auto — starts here, climbs as the chain grows)_ — words must be *${cfg.minLength}+ letters*\n` +
+            `⏱️ *${cfg.timerSeconds}s per turn* | 💥 *${cfg.maxStrikes} strikes* and you're out\n` +
+            `⏳ *Match length: ${minutesLabel} min* — the clock runs on its own; no one has to stop it\n` +
+            `🎨 Themed words (Animals, Food) unlock automatically the longer the group goes without a strike\n\n` +
             `📜 *How it works:* say a real word. The next player must say a NEW word ` +
-            `starting with the LAST letter of yours. No repeats!\n` +
-            `💡 Stuck? Type *${PREFIX} hint* on your turn for a nudge. Type *${PREFIX} scores* any time to check the board.\n\n` +
-            `🎯 *${nameTag(openerNumber, gameState.playerNames, settings)}, you open the chain!* Say any word (${cfg.minLength}+ letters) to start. 🔥`,
+            `starting with the LAST letter of yours. No repeats!\n\n` +
+            `🎯 *${nameTag(openerNumber, gameState.playerNames, settings)}, you open the chain!* Say any word (${cfg.minLength}+ letters) to start. 🔥`),
         mentions: openerJid ? [openerJid] : []
     })
 
     persistGames()
     startTurnCountdown(chatId, ctx)
+    startMatchCountdown(chatId, ctx)
 }
 
 // ─── Chain board ──────────────────────────────────────────────────
@@ -211,101 +304,202 @@ async function sendChainBoard(chatId, actionFeedback = '', ctx) {
     } else {
         boardText += `Chain is empty — first word can be anything!\n`
     }
+    const themeLine = themeBadge(gameState.roundTheme)
+    if (themeLine) boardText += `${themeLine}\n`
     boardText += `💥 *${currentPlayerName}'s strikes: ${currentStrikes}/${gameState.roundMaxStrikes}*\n\n`
     boardText += `🎯 *Your turn:* ${currentPlayerName}\n`
-    boardText += `_⏱️ ${gameState.roundTimerSeconds}s — type a real word, ${gameState.roundMinLength}+ letters, no repeats! (${PREFIX} hint if stuck)_`
+    boardText += `_⏱️ ${gameState.roundTimerSeconds}s — type a real word, ${gameState.roundMinLength}+ letters, no repeats!_`
 
-    await sock.sendMessage(chatId, {
+    await safeSend(sock, chatId, {
         text: boardText,
         mentions: currentPlayerJid ? [currentPlayerJid] : []
     })
 
-    gameState.hintGivenThisTurn = false
     startTurnCountdown(chatId, ctx)
 }
 
 // ─── Turn countdown ───────────────────────────────────────────────
-// resume:true preserves gameState.turnSecondsLeft instead of resetting it
-// to the full round duration — used by /wcg resume so a pause can't be
-// used to refresh a player's clock for free.
-function startTurnCountdown(chatId, ctx, { resume = false } = {}) {
+// opts.preserveRemaining=true resumes from gameState.turnSecondsLeft
+// instead of resetting to the full duration — used by /wcg resume so a
+// pause doesn't hand the current player a free full timer refresh.
+function startTurnCountdown(chatId, ctx, opts = {}) {
     const { sock, games, settings, persistGames } = ctx
     const gameState = getGameState(chatId, games)
     if (gameState.turnTimer) clearInterval(gameState.turnTimer)
 
-    if (!resume) {
+    if (!opts.preserveRemaining) {
         gameState.turnSecondsLeft = gameState.roundTimerSeconds || 30
     }
 
     gameState.turnTimer = setInterval(async () => {
-        try {
-            if (!gameState.active || gameState.paused) {
-                clearInterval(gameState.turnTimer)
-                return
-            }
-
-            gameState.turnSecondsLeft--
-
-            const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
-            const currentPlayerJid    = gameState.playerJids[currentPlayerNumber]
-            const currentPlayerName   = nameTag(currentPlayerNumber, gameState.playerNames, settings)
-
-            if (gameState.turnSecondsLeft <= 0) {
-                clearInterval(gameState.turnTimer)
-                await applyStrike(chatId, currentPlayerNumber, `⏰ *Timeout!* ${currentPlayerName} ran out of time.`, ctx)
-            } else if (gameState.turnSecondsLeft === 10) {
-                await sock.sendMessage(chatId, {
-                    text: `⏱️ *${currentPlayerName}, 10 seconds left!* 🤔`,
-                    mentions: currentPlayerJid ? [currentPlayerJid] : []
-                })
-            } else if (gameState.turnSecondsLeft === 5) {
-                await sock.sendMessage(chatId, {
-                    text: `🚨 *${currentPlayerName} — 5 seconds! GO!* ⚡`,
-                    mentions: currentPlayerJid ? [currentPlayerJid] : []
-                })
-            }
-
-            persistGames()
-        } catch (err) {
-            console.error('[WordChain] turn timer error:', err)
+        if (!gameState.active || gameState.paused) {
             clearInterval(gameState.turnTimer)
+            return
         }
+
+        gameState.turnSecondsLeft--
+
+        const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
+        const currentPlayerJid    = gameState.playerJids[currentPlayerNumber]
+        const currentPlayerName   = nameTag(currentPlayerNumber, gameState.playerNames, settings)
+
+        if (gameState.turnSecondsLeft <= 0) {
+            clearInterval(gameState.turnTimer)
+            await applyStrike(chatId, currentPlayerNumber, `⏰ *Timeout!* ${currentPlayerName} ran out of time.`, ctx)
+        } else if (gameState.turnSecondsLeft === 10) {
+            await safeSend(sock, chatId, {
+                text: `⏱️ *${currentPlayerName}, 10 seconds left!* 🤔`,
+                mentions: currentPlayerJid ? [currentPlayerJid] : []
+            })
+        } else if (gameState.turnSecondsLeft === 5) {
+            await safeSend(sock, chatId, {
+                text: `🚨 *${currentPlayerName} — 5 seconds! GO!* ⚡`,
+                mentions: currentPlayerJid ? [currentPlayerJid] : []
+            })
+        }
+
+        persistGames()
     }, 1000)
 }
 
-// ─── Adaptive drift — runs once, when a match actually ends ────────
-function applyAdaptiveDrift(gameState) {
-    const turns = gameState.totalTurnsThisMatch
-    if (turns <= 0) return // nobody took a turn (e.g. instant admin stop) — no signal, leave tier alone
+// ─── Match-duration countdown — the ONLY clock that can end a match
+// without a winner/loser being decided by play. Runs alongside the
+// turn timer; freezes together with it on /wcg pause. ────────────────
+function startMatchCountdown(chatId, ctx) {
+    const { sock, games, persistGames } = ctx
+    const gameState = getGameState(chatId, games)
+    if (gameState.matchTimer) clearInterval(gameState.matchTimer)
 
-    const strikeRate = gameState.totalStrikesThisMatch / turns
-    if (strikeRate > STRIKE_RATE_EASIER_ABOVE) {
-        gameState.tier = Math.max(MIN_TIER, gameState.tier - 1)
-    } else if (strikeRate < STRIKE_RATE_HARDER_BELOW) {
-        gameState.tier = Math.min(MAX_TIER, gameState.tier + 1)
-    }
+    gameState.matchTimer = setInterval(async () => {
+        if (!gameState.active) {
+            clearInterval(gameState.matchTimer)
+            return
+        }
+        if (gameState.paused) return   // frozen together with the turn timer
+
+        gameState.matchSecondsLeft--
+
+        if (gameState.matchSecondsLeft <= 0) {
+            clearInterval(gameState.matchTimer)
+            await endMatchByTime(chatId, ctx)
+        } else if (gameState.matchSecondsLeft === 60) {
+            await safeSend(sock, chatId, { text: `⏳ *1 minute left in this match!*` })
+        } else if (gameState.matchSecondsLeft === 30) {
+            await safeSend(sock, chatId, { text: `⏳ *30 seconds left in this match!*` })
+        } else if (gameState.matchSecondsLeft === 10) {
+            await safeSend(sock, chatId, { text: `🚨 *10 seconds — final words!*` })
+        }
+        persistGames()
+    }, 1000)
 }
 
-async function endMatch(chatId, ctx, resultInfo) {
-    const { sock, games, settings, activeGameChatRef, persistGames } = ctx
+// Picks a result when the match clock — not play — ends the round.
+// Tie-break order: most words contributed to the chain → fewest
+// lifetime strikes → earliest player in turn order (deterministic,
+// since the loop below only replaces `best` on a strict improvement).
+function pickTimeUpWinner(gameState) {
+    const candidates = gameState.players || []
+    if (candidates.length === 0) return null
+    let best = null
+    for (const num of candidates) {
+        const played  = gameState.wordsPlayedByPlayer[num] || 0
+        const strikes = gameState.strikesTotalByPlayer[num] || 0
+        if (!best || played > best.played || (played === best.played && strikes < best.strikes)) {
+            best = { num, played, strikes }
+        }
+    }
+    return best ? best.num : null
+}
+
+async function endMatchByTime(chatId, ctx) {
+    const { sock, games, activeGameChatRef, persistGames } = ctx
     const gameState = getGameState(chatId, games)
+    if (!gameState.active) return
 
-    applyAdaptiveDrift(gameState)
     gameState.active = false
-    safeClearActiveRef(activeGameChatRef, chatId)
+    if (gameState.turnTimer)  clearInterval(gameState.turnTimer)
+    if (gameState.matchTimer) clearInterval(gameState.matchTimer)
+    if (activeGameChatRef.value === chatId) activeGameChatRef.value = null
 
-    await matchSummary.sendMatchReport(sock, chatId, gameState, resultInfo, (n) => nameTag(n, gameState.playerNames, settings))
+    const winnerNumber = pickTimeUpWinner(gameState)
+    await safeSend(sock, chatId, { text: `⏰ *Time's up!* The match has ended.` })
     persistGames()
+    await endMatch(chatId, gameState, ctx, { type: 'time_up', winnerNumber }, { autoRestart: true })
+}
+
+// ─── Once-per-match auto-difficulty drift — carries into the NEXT match ──
+// Evaluated when a match ends, not per turn — Word Chain's natural
+// difficulty unit is a whole match (many turns), unlike the math games.
+// This is what makes tomorrow's starting word length higher than
+// today's if the group keeps cruising, on top of the live in-match
+// progression climbing further during any single match.
+function driftTierForNextMatch(gameState) {
+    const turns = gameState.totalTurnsThisMatch
+    if (turns === 0) return { changed: false }
+
+    const strikeRate = gameState.totalStrikesThisMatch / turns
+    const before = gameState.tier
+
+    if (strikeRate > DRIFT_STRUGGLE_STRIKE_RATE) {
+        gameState.tier = Math.max(0, gameState.tier - 1)
+    } else if (strikeRate < DRIFT_CRUISE_STRIKE_RATE) {
+        gameState.tier = Math.min(MAX_TIER, gameState.tier + 1)
+    }
+
+    return { changed: gameState.tier !== before, from: before, to: gameState.tier, strikeRate }
+}
+
+// ─── Milestones ───────────────────────────────────────────────────
+async function checkChainMilestone(chatId, gameState, ctx) {
+    const hit = CHAIN_MILESTONES.find(m =>
+        gameState.chain.length === m.length && !gameState.milestonesHit.includes(m.length)
+    )
+    if (!hit) return
+    gameState.milestonesHit.push(hit.length)
+    await safeSend(ctx.sock, chatId, { text: hit.text })
+}
+
+// ─── End-of-match wrapper — drifts tier, delegates to matchSummary,
+// and (unless this was an admin-forced stop) schedules the engine's
+// own autopilot restart. No admin has to type /wcg start again. ────────
+async function endMatch(chatId, gameState, ctx, resultInfo, opts = {}) {
+    if (gameState.turnTimer)  clearInterval(gameState.turnTimer)
+    if (gameState.matchTimer) clearInterval(gameState.matchTimer)
+
+    const drift = driftTierForNextMatch(gameState)
+    await matchSummary.sendMatchReport(
+        ctx.sock, chatId, gameState, resultInfo,
+        (n) => nameTag(n, gameState.playerNames, ctx.settings),
+        drift
+    )
+
+    if (opts.autoRestart) scheduleAutoRestart(chatId, ctx)
+}
+
+function scheduleAutoRestart(chatId, ctx) {
+    const { activeGameChatRef } = ctx
+    setTimeout(async () => {
+        try {
+            // Don't steal the lock if something else has claimed it in the
+            // meantime (another chat's game, or an admin already acting).
+            if (activeGameChatRef.value) return
+            await openLobby(chatId, ctx, { auto: true })
+        } catch (err) {
+            console.log('[WordChain] auto-restart failed:', err && err.message)
+        }
+    }, AUTO_RESTART_COOLDOWN_SECONDS * 1000)
 }
 
 // ─── Apply a strike and handle elimination ─────────────────────────
 async function applyStrike(chatId, playerNumber, reasonText, ctx) {
-    const { sock, games, settings } = ctx
+    const { sock, games, settings, activeGameChatRef, persistGames } = ctx
     const gameState = getGameState(chatId, games)
 
-    gameState.totalTurnsThisMatch++
-    gameState.totalStrikesThisMatch++
     gameState.strikes[playerNumber] = (gameState.strikes[playerNumber] || 0) + 1
+    gameState.strikesTotalByPlayer[playerNumber] = (gameState.strikesTotalByPlayer[playerNumber] || 0) + 1
+    gameState.totalStrikesThisMatch++
+    gameState.totalTurnsThisMatch++
+    gameState.wordsSinceStrike = 0   // a strike keeps the group on the current theme longer, never punishes with a switch
     const strikeCount = gameState.strikes[playerNumber]
     const removedIndex = gameState.currentTurnIndex
 
@@ -321,14 +515,20 @@ async function applyStrike(chatId, playerNumber, reasonText, ctx) {
 
         const lastStanding = matchSummary.checkLastPlayerStanding(gameState)
         if (lastStanding) {
-            await sock.sendMessage(chatId, { text: `${dqText}\n\n🏆 *LAST PLAYER STANDING!*` })
-            await endMatch(chatId, ctx, { type: 'winner', winnerNumber: lastStanding })
+            gameState.active = false
+            if (activeGameChatRef.value === chatId) activeGameChatRef.value = null
+            await safeSend(sock, chatId, { text: `${dqText}\n\n🏆 *LAST PLAYER STANDING!*` })
+            await endMatch(chatId, gameState, ctx, { type: 'winner', winnerNumber: lastStanding }, { autoRestart: true })
+            persistGames()
             return
         }
 
         if (gameState.players.length === 0) {
-            await sock.sendMessage(chatId, { text: `${dqText}\n\n💀 *GAME OVER!* No players remain.` })
-            await endMatch(chatId, ctx, { type: 'solo_end' })
+            gameState.active = false
+            if (activeGameChatRef.value === chatId) activeGameChatRef.value = null
+            await safeSend(sock, chatId, { text: `${dqText}\n\n💀 *GAME OVER!* No players remain.` })
+            await endMatch(chatId, gameState, ctx, { type: 'solo_end' }, { autoRestart: true })
+            persistGames()
             return
         }
 
@@ -341,16 +541,6 @@ async function applyStrike(chatId, playerNumber, reasonText, ctx) {
     gameState.currentTurnIndex = nextTurnIndex
     const feedback = `${reasonText}\n_(${strikeCount}/${gameState.roundMaxStrikes} strikes)_`
     await sendChainBoard(chatId, feedback, ctx)
-}
-
-// ─── Milestone celebration (engagement) ─────────────────────────────
-function milestoneLineIfAny(gameState) {
-    const nextMilestone = CHAIN_MILESTONES[gameState.nextMilestoneIndex]
-    if (nextMilestone && gameState.chain.length >= nextMilestone) {
-        gameState.nextMilestoneIndex++
-        return `\n\n🎉 *${nextMilestone}-word chain!* This group is on fire.`
-    }
-    return ''
 }
 
 // ─── Word submission — the core validation pipeline ────────────────
@@ -381,16 +571,18 @@ async function processWordSubmission(chatId, senderNumber, rawWord, ctx) {
     if (gameState.usedWords.includes(word)) {
         return applyStrike(chatId, senderNumber, `❌ *${currentPlayerName}* — *${word.toUpperCase()}* was already used in this chain.`, ctx)
     }
-    const themeWords = activeThemeWords(words)
+    const themeWords = themeWordsFor(words, gameState.roundTheme)
     if (!dictionary.isAcceptedWord(word, themeWords)) {
         return applyStrike(chatId, senderNumber, `❌ *${currentPlayerName}* — *${word.toUpperCase()}* isn't a recognized word.`, ctx)
     }
 
     // ── Accepted ──
-    gameState.totalTurnsThisMatch++
     gameState.chain.push({ word, playerNumber: senderNumber })
     gameState.usedWords.push(word)
     gameState.strikes[senderNumber] = 0
+    gameState.totalTurnsThisMatch++
+    gameState.wordsPlayedByPlayer[senderNumber] = (gameState.wordsPlayedByPlayer[senderNumber] || 0) + 1
+    gameState.wordsSinceStrike++
 
     if (word.length > gameState.longestWordThisMatch.length) {
         gameState.longestWordThisMatch   = word
@@ -401,46 +593,34 @@ async function processWordSubmission(chatId, senderNumber, rawWord, ctx) {
     gameState.currentTurnIndex = nextTurnIndex
 
     const themeNote = (themeWords.includes(word) && !dictionary.isRealWord(word)) ? ' 🎨' : ''
-    const feedback = `✅ *${currentPlayerName}* played *${word.toUpperCase()}*!${themeNote} 🟢${milestoneLineIfAny(gameState)}`
+    const feedback = `✅ *${currentPlayerName}* played *${word.toUpperCase()}*!${themeNote} 🟢`
     persistGames()
+
+    await applyProgression(chatId, gameState, ctx)
+    await maybeRotateTheme(chatId, gameState, ctx)
+    await checkChainMilestone(chatId, gameState, ctx)
     await sendChainBoard(chatId, feedback, ctx)
-}
-
-// ─── Hint (player-facing, once per turn — see COMMAND_CONTROL.md) ──
-// Reveals only a fragment: the required starting letter's word LENGTH
-// and its first two letters from one real dictionary candidate that
-// hasn't been used yet — never the full word.
-function getHint(chatId, ctx) {
-    const { games, words } = ctx
-    const gameState = getGameState(chatId, games)
-    if (!gameState.active || gameState.paused) return { ok: false, reason: 'no_round' }
-    if (gameState.hintGivenThisTurn) return { ok: false, reason: 'already_given' }
-
-    const lastEntry = gameState.chain.length ? gameState.chain[gameState.chain.length - 1] : null
-    const requiredLetter = lastEntry ? lastEntry.word.slice(-1) : null
-    const themeWords = activeThemeWords(words)
-    const candidate = dictionary.findHintCandidate(requiredLetter, gameState.roundMinLength, gameState.usedWords, themeWords)
-
-    if (!candidate) return { ok: false, reason: 'no_candidate' }
-
-    gameState.hintGivenThisTurn = true
-    ctx.persistGames()
-    return { ok: true, length: candidate.length, prefix: candidate.slice(0, 2).toUpperCase(), requiredLetter }
 }
 
 module.exports = {
     DEFAULT_WORDS,
-    tierConfigFor,
-    activeThemeWords,
-    getGameState,
     stateKey,
+    roundConfigForTier,
+    progressionConfigForChain,
+    themeWordsFor,
+    matchDurationSecondsFor,
+    getGameState,
+    openLobby,
     startLobbyCountdown,
     startActualGame,
     sendChainBoard,
     startTurnCountdown,
+    startMatchCountdown,
     processWordSubmission,
-    applyAdaptiveDrift,
+    applyStrike,
+    driftTierForNextMatch,
+    pickTimeUpWinner,
     endMatch,
-    getHint,
-    safeClearActiveRef
+    endMatchByTime,
+    safeSend
 }

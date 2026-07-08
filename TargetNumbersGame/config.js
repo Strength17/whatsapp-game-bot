@@ -38,5 +38,17 @@ module.exports = {
     // reached quickly bumps the tier up; a round where nobody gets
     // within 10 bumps it down. Same single-signal pattern as every
     // other game in this project.
-    SOLVE_FAST_RATIO: 0.5
+    SOLVE_FAST_RATIO: 0.5,
+
+    // No-engagement stop: a round is "empty" if nobody submitted
+    // anything at all by timeout. This many empty rounds in a row
+    // ends the session (no auto-restart) instead of looping forever
+    // in an unattended chat.
+    MAX_CONSECUTIVE_EMPTY_ROUNDS: 2,
+    ROUND_HISTORY_CAP: 20,       // trim stored round history to this many entries
+    ROUND_HISTORY_REPORT_SHOW: 8, // show at most this many in the session report
+
+    // §A9 card-style formatting — never hardcode the divider inline.
+    DIVIDER:   '━━━━━━━━━━━━━━━━━━━━━━',
+    BOT_EMOJI: '🤖'
 }

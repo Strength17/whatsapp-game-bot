@@ -22,10 +22,19 @@ function getTgtSettings(settings) {
     }
 }
 
+// BUG FIX (§A2): state must live under a GAME_KEY-prefixed flat key —
+// `games` is one shared object for the whole bot, and `games[chatId]`
+// is a bare object any other game could also write to. stateKey() is
+// exported so every other file constructs the same key instead of
+// reconstructing it inline.
+function stateKey(chatId) {
+    return `${config.GAME_KEY}:${chatId}`
+}
+
 function getGameState(chatId, games) {
-    if (!games[chatId]) games[chatId] = {}
-    if (!games[chatId].target) {
-        games[chatId].target = {
+    const key = stateKey(chatId)
+    if (!games[key]) {
+        games[key] = {
             active:        false,
             roundActive:   false,
             tier:          config.START_TIER,
@@ -42,10 +51,17 @@ function getGameState(chatId, games) {
             bestSolveDiff: null,
             bestSolveBy:   null,
             hintGivenThisRound: false,
-            submissions:   []   // [{ senderNumber, value, diff, expr, ts }] — this round only
+            submissions:   [],  // [{ senderNumber, value, diff, expr, ts }] — this round only
+            // Engagement tracking (§B2/§C1-C2) — how many rounds in a row
+            // NOBODY submitted anything at all (not just nobody scoring).
+            consecutiveEmptyRounds: 0,
+            // Per-round recap for the session-end report (§C1/§C4), capped
+            // to avoid unbounded growth in a very long session.
+            roundHistory: [],
+            halfwayWarned: false
         }
     }
-    return games[chatId].target
+    return games[key]
 }
 
 function clearTimers(gameState) {
@@ -82,20 +98,28 @@ async function startSession(chatId, ctx, { auto = false } = {}) {
     gameState.playerJids   = {}
     gameState.bestSolveDiff = null
     gameState.bestSolveBy   = null
+    gameState.consecutiveEmptyRounds = 0
+    gameState.roundHistory  = []
     activeGameChatRef.value = chatId
     persistGames()
 
     if (auto) {
         await sock.sendMessage(chatId, { text: `🔁 *New ${config.GAME_NAME} session starting!*` })
     } else {
+        // COMPLIANCE FIX: "session start" is explicitly listed as a card
+        // type in §A9/BOT_STYLE_GUIDE — was plain text before.
         await sock.sendMessage(chatId, {
             text:
-                `🎯 *${config.GAME_NAME} (${config.GAME_ACRONYM})*\n` +
+                `${config.DIVIDER}\n` +
+                `${config.BOT_EMOJI} *${config.GAME_NAME} (${config.GAME_ACRONYM})*\n` +
+                `${config.DIVIDER}\n\n` +
                 `Each round: 6 numbers + a 3-digit target. Combine any of the numbers with \`+ − × ÷\` ` +
                 `(don't have to use them all, each used once, every step must stay a positive whole number) to hit the target.\n` +
                 `🎯 Exact = ${config.SCORE_EXACT}pts · within 5 = ${config.SCORE_WITHIN_5}pts · within 10 = ${config.SCORE_WITHIN_10}pts.\n` +
                 `An exact hit ends the round instantly — otherwise the closest submission wins when time's up!\n\n` +
-                `_Commands: ${config.PREFIX} scores · ${config.PREFIX} hint · ${config.PREFIX} help_`
+                `_Commands: ${config.PREFIX} scores · ${config.PREFIX} hint · ${config.PREFIX} help_\n\n` +
+                `${config.DIVIDER}\n` +
+                `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
         })
     }
 
@@ -110,11 +134,26 @@ async function stopSession(chatId, ctx, reason = 'manual') {
     clearTimers(gameState)
     gameState.active      = false
     gameState.roundActive = false
+    // BUG FIX (§A6): only clear the shared active-chat pointer if THIS
+    // chat is the one actually holding it — never unconditionally.
     if (activeGameChatRef.value === chatId) activeGameChatRef.value = null
     persistGames()
 
-    await matchSummary.sendSessionReport(sock, chatId, gameState, (n) => nameTag(n, gameState.playerNames, ctx.settings), reason)
+    if (reason === 'no_engagement') {
+        await sock.sendMessage(chatId, {
+            text:
+                `🛑 *${config.GAME_NAME} paused — no one's playing.*\n` +
+                `No submissions for ${config.MAX_CONSECUTIVE_EMPTY_ROUNDS} rounds in a row, so the session ended automatically.\n` +
+                `Type *${config.PREFIX} start* whenever you're ready for a fresh one!`
+        }).catch(() => {})
+    }
 
+    await matchSummary.sendSessionReport(sock, chatId, gameState, (n) => nameTag(n, gameState.playerNames, ctx.settings), reason, config)
+
+    // BUG FIX (§B2): a session that ended because nobody was engaging
+    // must NOT auto-restart — that's exactly the infinite-loop-in-an-
+    // unattended-chat bug this fix exists to close. Only a real
+    // rounds-complete ending schedules a rematch.
     if (reason === 'rounds_complete') scheduleAutoRestart(chatId, ctx)
 }
 
@@ -128,7 +167,15 @@ function scheduleAutoRestart(chatId, ctx) {
     }).catch(() => {})
 
     gameState.cooldownTimer = setTimeout(() => {
-        startSession(chatId, ctx, { auto: true }).catch(() => {})
+        // BUG FIX (§A6): every timer callback body wrapped in try/catch
+        // with a defensive clear, so one bad tick can't leave a dangling
+        // half-broken timer or an unhandled rejection.
+        try {
+            startSession(chatId, ctx, { auto: true }).catch(() => {})
+        } catch (err) {
+            console.error('[TargetNumbers] scheduleAutoRestart error:', err)
+            clearTimeout(gameState.cooldownTimer)
+        }
     }, sessionCooldown * 1000)
 }
 
@@ -147,6 +194,7 @@ async function startRound(chatId, ctx) {
     gameState.roundSecondsLeft = roundSeconds
     gameState.hintGivenThisRound = false
     gameState.submissions    = []
+    gameState.halfwayWarned  = false
     persistGames()
 
     await sock.sendMessage(chatId, {
@@ -158,23 +206,49 @@ async function startRound(chatId, ctx) {
     })
 
     if (gameState.roundTimer) clearInterval(gameState.roundTimer)
+    const halfwayMark = Math.max(11, Math.floor(roundSeconds / 2)) // never overlaps the 10s final warning
     gameState.roundTimer = setInterval(async () => {
-        if (!gameState.roundActive) { clearInterval(gameState.roundTimer); return }
-        gameState.roundSecondsLeft--
+        // BUG FIX (§A6): the whole tick wrapped in try/catch with a
+        // defensive clearInterval on failure — this callback isn't
+        // covered by any per-message error boundary elsewhere.
+        try {
+            if (!gameState.roundActive) { clearInterval(gameState.roundTimer); return }
+            gameState.roundSecondsLeft--
 
-        if (gameState.roundSecondsLeft <= 0) {
+            if (gameState.roundSecondsLeft <= 0) {
+                clearInterval(gameState.roundTimer)
+                await handleRoundTimeout(chatId, ctx)
+            } else if (gameState.roundSecondsLeft === 10) {
+                await sock.sendMessage(chatId, { text: `🚨 *10 seconds left!* Target *${gameState.currentTarget}* — numbers: ${gameState.currentNumbers.join(', ')}` })
+            } else if (!gameState.halfwayWarned && gameState.roundSecondsLeft === halfwayMark) {
+                // Earlier, calmer warning tier (§A9 timer escalation) — no
+                // alarm emoji, just a neutral heads-up.
+                gameState.halfwayWarned = true
+                await sock.sendMessage(chatId, { text: `⏱️ *Halfway there* — ${halfwayMark}s left on target *${gameState.currentTarget}*.` })
+            }
+            persistGames()
+        } catch (err) {
+            console.error('[TargetNumbers] round timer error:', err)
             clearInterval(gameState.roundTimer)
-            await handleRoundTimeout(chatId, ctx)
-        } else if (gameState.roundSecondsLeft === 10) {
-            await sock.sendMessage(chatId, { text: `🚨 *10 seconds left!* Target *${gameState.currentTarget}* — numbers: ${gameState.currentNumbers.join(', ')}` })
         }
-        persistGames()
     }, 1000)
 }
 
 function adjustTier(gameState, { scoredWell }) {
     if (scoredWell) gameState.tier = Math.min(config.MAX_TIER, gameState.tier + 1)
     else            gameState.tier = Math.max(config.MIN_TIER, gameState.tier - 1)
+}
+
+function pushRoundHistory(gameState, { winnerNumber = null, winnerName = null, winningExpr = null, diff = null, points = 0 } = {}) {
+    gameState.roundHistory.push({
+        roundNumber: gameState.roundsPlayed + 1,
+        numbers:     gameState.currentNumbers.slice(),
+        target:      gameState.currentTarget,
+        winnerNumber, winnerName, winningExpr, diff, pointsAwarded: points
+    })
+    if (gameState.roundHistory.length > config.ROUND_HISTORY_CAP) {
+        gameState.roundHistory = gameState.roundHistory.slice(-config.ROUND_HISTORY_CAP)
+    }
 }
 
 async function advanceAfterRound(chatId, ctx) {
@@ -190,7 +264,14 @@ async function advanceAfterRound(chatId, ctx) {
 
     gameState.roundActive = false
     ctx.persistGames()
-    gameState.cooldownTimer = setTimeout(() => { startRound(chatId, ctx).catch(() => {}) }, cooldownSeconds * 1000)
+    gameState.cooldownTimer = setTimeout(() => {
+        try {
+            startRound(chatId, ctx).catch(() => {})
+        } catch (err) {
+            console.error('[TargetNumbers] advanceAfterRound error:', err)
+            clearTimeout(gameState.cooldownTimer)
+        }
+    }, cooldownSeconds * 1000)
 }
 
 function scoreForDiff(diff) {
@@ -222,6 +303,24 @@ async function handleRoundTimeout(chatId, ctx) {
     const gameState = getGameState(chatId, games)
     gameState.roundActive = false
 
+    // BUG FIX (§B2/§C2): engagement tracking. A round is "empty" only if
+    // NOBODY submitted anything at all — not just nobody scoring. Any
+    // submission during the round already reset this counter the moment
+    // it came in (see handleGuessAttempt), but we re-derive it here too
+    // as the authoritative check, per spec.
+    if (gameState.submissions.length === 0) {
+        gameState.consecutiveEmptyRounds = (gameState.consecutiveEmptyRounds || 0) + 1
+    } else {
+        gameState.consecutiveEmptyRounds = 0
+    }
+
+    if (gameState.consecutiveEmptyRounds >= config.MAX_CONSECUTIVE_EMPTY_ROUNDS) {
+        pushRoundHistory(gameState) // empty round, no winner
+        ctx.persistGames()
+        await stopSession(chatId, ctx, 'no_engagement')
+        return // skip the normal advanceAfterRound flow entirely
+    }
+
     // Best of everyone's submissions this round, if any.
     let winner = null
     for (const sub of gameState.submissions) {
@@ -237,6 +336,10 @@ async function handleRoundTimeout(chatId, ctx) {
                 `⏰ *Time's up!* Closest was *${nameTag(winner.senderNumber, gameState.playerNames, ctx.settings)}*: ` +
                 `\`${winner.expr} = ${winner.value}\` (target ${gameState.currentTarget}, off by ${winner.diff}) — +${points}pts 🎉`
         })
+        pushRoundHistory(gameState, {
+            winnerNumber: winner.senderNumber, winnerName: winner.senderName,
+            winningExpr: winner.expr, diff: winner.diff, points
+        })
         await awardAndAdvance(chatId, ctx, winner.senderNumber, winner.diff, null)
         return
     }
@@ -249,6 +352,7 @@ async function handleRoundTimeout(chatId, ctx) {
             `Next round in a few seconds...`
     })
 
+    pushRoundHistory(gameState) // no winner this round
     adjustTier(gameState, { scoredWell: false })
     await advanceAfterRound(chatId, ctx)
 }
@@ -264,6 +368,11 @@ async function handleGuessAttempt(chatId, text, sender, ctx) {
     const gameState = getGameState(chatId, games)
     if (!gameState.active || !gameState.roundActive) return false
     if (!solver.looksLikeExpression(text)) return false
+
+    // BUG FIX (§B2/§C2): any genuine attempt at all — right or wrong,
+    // valid numbers or not — is engagement, and resets the no-engagement
+    // clock immediately rather than waiting for the timeout check.
+    gameState.consecutiveEmptyRounds = 0
 
     const { senderNumber, senderJid, senderName } = sender
     const validation = solver.validateSolution(text, gameState.currentNumbers, gameState.currentTarget)
@@ -301,6 +410,10 @@ async function handleGuessAttempt(chatId, text, sender, ctx) {
             mentions: senderJid ? [senderJid] : []
         })
 
+        pushRoundHistory(gameState, {
+            winnerNumber: senderNumber, winnerName: senderName,
+            winningExpr: text.trim(), diff: 0, points: config.SCORE_EXACT
+        })
         ctx.persistGames()
         await awardAndAdvance(chatId, ctx, senderNumber, 0, elapsedMs)
         return true
@@ -334,6 +447,7 @@ function getHint(chatId, ctx) {
 
 module.exports = {
     getGameState,
+    stateKey,
     getTgtSettings,
     startSession,
     stopSession,

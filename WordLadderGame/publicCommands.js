@@ -20,8 +20,15 @@ const THEME_EMOJI = {
 async function handlePublicMessage(msgCtx) {
     const {
         sock, games, settings, activeGameChatRef, persistGames, nameCache,
-        sendSafeMessage, from, body, rawBody, senderNumber, senderName, isAdmin,
+        sendSafeMessage: _sendSafeMessage, from, body, rawBody, senderNumber, senderName, isAdmin,
     } = msgCtx;
+
+    // The shared contract is sendSafeMessage(sock, jid, payload). This file
+    // was written against a local (jid, text) convention throughout — shim
+    // it here once instead of touching every call site, so every existing
+    // `sendSafeMessage(from, someString)` call below keeps working.
+    const sendSafeMessage = (jid, text) =>
+        _sendSafeMessage(sock, jid, typeof text === 'string' ? { text } : text);
 
     const state = engine.getGameState(from, games);
     const text  = (body || '').trim().toLowerCase();
@@ -142,7 +149,7 @@ async function handlePublicMessage(msgCtx) {
         const fresh = engine.createFreshState();
         fresh.theme      = state.theme;
         fresh.wordLength = state.wordLength;
-        games[from] = fresh;
+        games[engine.stateKey(from)] = fresh;
         persistGames();
         await sendSafeMessage(from, `♻️ Game reset! All scores cleared. Type *!wlg start* to play.`);
         return;

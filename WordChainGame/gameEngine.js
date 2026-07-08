@@ -10,16 +10,16 @@ const matchSummary = require('./matchSummary')
 const dictionary   = require('./dictionary')
 const { nameTag, resolveSetting } = require('../permissions')
 const { difficultyBadge, themeBadge } = require('./display')
-const { DIFFICULTY_CONFIG, MIN_TIMER_SECONDS, DEFAULT_MAX_STRIKES, LOBBY_SECONDS, PREFIX } = require('./config')
+const { GAME_KEY, DIFFICULTY_CONFIG, MIN_TIMER_SECONDS, DEFAULT_MAX_STRIKES, LOBBY_SECONDS, PREFIX } = require('./config')
 const { DEFAULT_WORDS } = require('./themeBank')
 
 // ─── Round config resolution (difficulty + overrides) ─────────
 function resolveRoundConfig(settings) {
-    const difficulty = resolveSetting('difficulty', settings, 'easy')
+    const difficulty = resolveSetting(`${GAME_KEY}_difficulty`, settings, 'easy')
     const base = DIFFICULTY_CONFIG[difficulty] || DIFFICULTY_CONFIG.easy
 
-    const manualTimer   = resolveSetting('timerSeconds', settings, 'auto')
-    const manualStrikes = resolveSetting('maxStrikes', settings, DEFAULT_MAX_STRIKES)
+    const manualTimer   = resolveSetting(`${GAME_KEY}_timerSeconds`, settings, 'auto')
+    const manualStrikes = resolveSetting(`${GAME_KEY}_maxStrikes`, settings, DEFAULT_MAX_STRIKES)
 
     const timerSeconds = (manualTimer === 'auto' || manualTimer === undefined)
         ? base.timerSeconds
@@ -39,9 +39,17 @@ function activeThemeWords(words) {
 }
 
 // ─── getGameState ───────────────────────────────────────────────
+// State is stored under a GAME_KEY-prefixed key (not the bare chatId) —
+// the `games` object is shared across every game module. See the same
+// note in HangmanGame/gameEngine.js.
+function stateKey(chatId) {
+    return `${GAME_KEY}:${chatId}`
+}
+
 function getGameState(chatId, games) {
-    if (!games[chatId]) {
-        games[chatId] = {
+    const key = stateKey(chatId)
+    if (!games[key]) {
+        games[key] = {
             active:            false,
             lobbyActive:       false,
             lobbyTimer:        null,
@@ -64,11 +72,11 @@ function getGameState(chatId, games) {
             longestWordThisMatchBy: ''
         }
     }
-    if (!games[chatId].strikes)    games[chatId].strikes    = {}
-    if (!games[chatId].chain)      games[chatId].chain      = []
-    if (!games[chatId].usedWords)  games[chatId].usedWords  = []
-    if (!games[chatId].playerJids) games[chatId].playerJids = {}
-    return games[chatId]
+    if (!games[key].strikes)    games[key].strikes    = {}
+    if (!games[key].chain)      games[key].chain      = []
+    if (!games[key].usedWords)  games[key].usedWords  = []
+    if (!games[key].playerJids) games[key].playerJids = {}
+    return games[key]
 }
 
 // ─── Lobby countdown ─────────────────────────────────────────────
@@ -89,7 +97,7 @@ function startLobbyCountdown(chatId, ctx) {
             clearInterval(gameState.lobbyTimer)
             await startActualGame(chatId, ctx)
         } else if (gameState.lobbySecondsLeft % 10 === 0) {
-            const difficulty = resolveSetting('difficulty', settings, 'easy')
+            const difficulty = resolveSetting(`${GAME_KEY}_difficulty`, settings, 'easy')
             const lobbyMentions = gameState.players.map(num => gameState.playerJids[num]).filter(Boolean)
             const lobbyText = gameState.players
                 .map((num, i) => `${i + 1}. ${nameTag(num, gameState.playerNames, settings)}`)

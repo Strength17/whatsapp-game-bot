@@ -860,16 +860,19 @@ async function handleAdminCommand(ctx) {
         words.push(...DEFAULT_WORDS)
         saveWords()
 
+        // Scope to THIS game's own keys only — the `games` object is shared
+        // across every game module, so wiping every key here would silently
+        // nuke other games' active sessions too.
         for (const key in games) {
+            if (!key.startsWith(`${config.GAME_KEY}:`)) continue
             const g = games[key]
             if (g.lobbyTimer)    clearInterval(g.lobbyTimer)
             if (g.turnTimer)     clearInterval(g.turnTimer)
             if (g.cooldownTimer) clearInterval(g.cooldownTimer)
             delete games[key]
         }
-        const GAMES_FILE = 'games.json'
-        if (fs.existsSync(GAMES_FILE)) fs.unlinkSync(GAMES_FILE)
-        activeGameChatRef.value = null
+        persistGames()
+        if (activeGameChatRef.value) activeGameChatRef.value = null
         await sendSafeMessage(sock, replyTo, {
             text:
                 `🔄 *Reset Complete* ✅\n\n` +

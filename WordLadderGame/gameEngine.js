@@ -55,11 +55,19 @@ function pickPuzzle(theme = cfg.DEFAULT_THEME, targetLength = cfg.START_WORD_LEN
 }
 
 // ── Lazy state creator (mirrors Hangman's getGameState pattern) ──────────────
+// State is stored under a GAME_KEY-prefixed key (not the bare chatId) —
+// the `games` object is shared across every game module. See the same
+// note in HangmanGame/gameEngine.js.
+function stateKey(chatId) {
+    return `${cfg.GAME_KEY}:${chatId}`;
+}
+
 function getGameState(chatId, games) {
-    if (!games[chatId]) {
-        games[chatId] = createFreshState();
+    const key = stateKey(chatId);
+    if (!games[key]) {
+        games[key] = createFreshState();
     }
-    return games[chatId];
+    return games[key];
 }
 
 function createFreshState() {
@@ -218,6 +226,7 @@ function getScoreboard(state, nameCache = {}) {
 
 module.exports = {
     getGameState,
+    stateKey,
     createFreshState,
     startRound,
     validateGuess,

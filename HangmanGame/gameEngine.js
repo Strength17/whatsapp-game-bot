@@ -145,9 +145,20 @@ function buildStickFigureDM(wrongCount, maxTries) {
 }
 
 // ─── getGameState ─────────────────────────────────────────────
+// State is stored under a GAME_KEY-prefixed key (not the bare chatId).
+// The `games` object is shared across every game module — without this
+// prefix, switching the active game in a chat that a DIFFERENT game had
+// previously used in would hand this game a wrong-shaped leftover state
+// object instead of a fresh one (confirmed to crash getScoreboard-style
+// code in other games). Every game module must follow this convention.
+function stateKey(chatId) {
+    return `${config.GAME_KEY}:${chatId}`
+}
+
 function getGameState(chatId, games) {
-    if (!games[chatId]) {
-        games[chatId] = {
+    const key = stateKey(chatId)
+    if (!games[key]) {
+        games[key] = {
             active:            false,
             lobbyActive:       false,
             lobbyTimer:        null,
@@ -170,11 +181,11 @@ function getGameState(chatId, games) {
             cooldownSecondsLeft: 0
         }
     }
-    if (typeof games[chatId].attempts === 'number') games[chatId].attempts = {}
-    if (!games[chatId].disqualified) games[chatId].disqualified = []
-    if (!games[chatId].playerJids)   games[chatId].playerJids   = {}
-    if (!games[chatId].wordLengthTarget) games[chatId].wordLengthTarget = config.START_WORD_LENGTH
-    return games[chatId]
+    if (typeof games[key].attempts === 'number') games[key].attempts = {}
+    if (!games[key].disqualified) games[key].disqualified = []
+    if (!games[key].playerJids)   games[key].playerJids   = {}
+    if (!games[key].wordLengthTarget) games[key].wordLengthTarget = config.START_WORD_LENGTH
+    return games[key]
 }
 
 // ─── Lobby countdown ──────────────────────────────────────────

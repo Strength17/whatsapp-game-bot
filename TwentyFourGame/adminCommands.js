@@ -21,11 +21,15 @@ async function handleAdminCommand(ctx) {
 
     const chatId = sender
     const reply = (t) => (typeof sendSafeMessage === 'function'
-        ? sendSafeMessage(chatId, { text: t })
+        ? sendSafeMessage(sock, chatId, { text: t })
         : sock.sendMessage(chatId, { text: t }))
 
     // Respect per-game admin scoping (mirrors HangmanGame's implementation).
     const senderIsCreator = senderTier === permissions.TIERS.CREATOR
+    const isAdmin = senderIsCreator || senderTier === permissions.TIERS.ADMIN
+    // SECURITY: without this gate, any non-admin sender could run every
+    // "/m4th ..." command below — this was reachable by the public before.
+    if (!isAdmin) return false
     if (!senderIsCreator) {
         const scope = settings.adminGameAccess || 'all'
         if (scope !== 'all' && scope !== config.GAME_KEY) return false

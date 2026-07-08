@@ -1,8 +1,19 @@
 # WhatsApp Bots · Sky Graphics
 
-A WhatsApp game bot (built on Baileys) that currently runs **HangMan Game
-(HMG)** and **Word Ladder Game (WLG)**, with a pluggable structure so the
-creator can add and switch between multiple games without touching the core bot.
+A WhatsApp game bot (built on Baileys) that currently runs **six games** —
+HangMan (HMG), Word Ladder (WLG), Word Chain (WCG), Target Numbers (TGT),
+The 24 Game (M4T), and Momentum (MMT) — with a pluggable structure so the
+creator can add and switch between them without touching the core bot.
+
+**→ For the exact plugin contract every game folder must follow (and why),
+see [`ARCHITECTURE.md`](./ARCHITECTURE.md).** That file is the canonical
+spec — this README is the tour. If you're building a new game (or handing
+this to another AI to build one), read `ARCHITECTURE.md` first.
+
+**→ Before every deploy, run `npm run verify`** (see `scripts/verify-games.js`).
+It catches missing dependencies, unwired game folders, broken contracts,
+and state-isolation bugs before Railway (or any host) ever sees them —
+see `reports/CHANGE_LOG.md` for the real incident this was built from.
 
 This file is written so it can be handed to **another AI** (or another
 developer) to build any new game and have it merge in with **zero changes
@@ -18,31 +29,25 @@ to any existing file**.
                              Contains no game-specific logic or strings.
 /permissions.js            ← shared, game-agnostic: CREATOR/ADMIN/PUBLIC
                              tier resolution, setting overrides, name tags.
-/games-registry.js          ← auto-discovers every game folder at boot.
+/games-registry.js          ← auto-discovers EVERY game folder at boot
+                             (scans the project root — nothing hardcoded).
 /game-switch-commands.js    ← shared creator-only commands (setgame,
                              setadminaccess, status), invoked directly by
                              index.js under the FIXED "/game" prefix —
                              never under any individual game's own prefix.
+/package.json               ← REQUIRED — see ARCHITECTURE.md §7.
+/scripts/verify-games.js    ← pre-deploy check, also runs via `npm start`.
 /README.md                  ← this file.
+/ARCHITECTURE.md            ← the plugin contract — read this to add a game.
 
-/HangmanGame/
-    config.js               ← GAME_KEY, GAME_NAME, PREFIX, ADMIN_PREFIX, tuning
-    gameEngine.js            ← pure game-state logic (lobby, turns, board,
-                             adaptive difficulty, cooldown, stick figures)
-    publicCommands.js        ← handles "!hmg ..." messages + live guesses
-    adminCommands.js         ← handles "/hmg ..." commands
-    matchSummary.js          ← disqualification bookkeeping + match report
+/HangmanGame/       ← !hmg / /hmg
+/WordLadderGame/    ← !wlg / /wlg
+/WordChainGame/     ← !wcg / /wcg
+/TargetNumbersGame/ ← !tgt / /tgt
+/TwentyFourGame/    ← !m4th / /m4th
+/MomentumGame/      ← !mmt / /mmt
 
-/WordLadderGame/
-    config.js               ← GAME_KEY, GAME_NAME, PREFIX, ADMIN_PREFIX, tuning
-    gameEngine.js           ← BFS solver, game state, adaptive difficulty, scoring
-    wordBank.js             ← 3–6 letter dictionary + 5 themed puzzle pair sets
-    publicCommands.js       ← handles "!wlg ..." messages + live word guesses
-    adminCommands.js        ← handles "/wlg ..." commands
-    matchSummary.js         ← session report builder
-    README.md               ← game-specific docs
-
-/<AnyNewGame>/              ← next game goes here; see "Plugin Contract" below
+/<AnyNewGame>/              ← next game goes here; see ARCHITECTURE.md
     config.js
     gameEngine.js
     publicCommands.js
@@ -82,86 +87,15 @@ to any existing file**.
 
 ---
 
-## 3. The plugin contract — what a new game folder MUST export
+## 3. The plugin contract — summary
 
-Drop a folder in the project root (e.g. `WordLadderGame/`) containing
-exactly these three files. `games-registry.js` requires them by these
-exact names — nothing else needs to change anywhere in the project.
-
-### `config.js`
-```js
-module.exports = {
-    GAME_KEY:     'mygame',      // lowercase, unique, used in settings.activeGame
-    GAME_NAME:    'My Game Name',
-    GAME_ACRONYM: 'MGN',
-    PREFIX:       '!mgn',        // public command prefix
-    ADMIN_PREFIX: '/mgn ',       // admin command prefix (note trailing space)
-    // ...any other tuning constants this game needs (timers, scoring, etc.)
-}
-```
-
-### `gameEngine.js`
-Pure game-state logic — timers, board building, win/lose detection. Must
-export `getGameState(chatId, games)` (same lazy-create pattern as
-Hangman's) since `index.js` calls it generically for both the admin
-`/status`-style commands and restart recovery. Also export
-`DEFAULT_WORDS` (or whatever the game's default content is) if `index.js`
-should be able to seed `words.json` on first boot.
-
-If your public-message handling (prefix commands + live gameplay) is a
-separate file, name it `publicCommands.js` and export
-`handlePublicMessage(msgCtx)` — `index.js` looks for that file
-automatically if `gameEngine.handlePublicMessage` isn't exported directly.
-Either shape works; Hangman uses the separate-file shape.
-
-`handlePublicMessage(msgCtx)` receives:
-```js
-{
-  sock, games, settings, words, activeGameChatRef, persistGames, nameCache,
-  sendSafeMessage, buildCtx, // buildCtx() -> { sock, games, settings, words, activeGameChatRef, persistGames, nameCache }
-  from, body, rawBody, senderNumber, senderJid, senderName, isAdmin
-}
-```
-It should return `true`/handle-and-continue; `index.js` doesn't require a
-particular return value today, but returning a boolean is good practice
-for testability.
-
-### `adminCommands.js`
-Must export `handleAdminCommand(ctx)`. `ctx` shape (built by `index.js`):
-```js
-{
-  sock, games, settings, words, activeGameChatRef, persistGames, nameCache,
-  pendingAdminChangeRef, saveSettings, saveWords, sendSafeMessage,
-  getGameState, startTurnCountdown, fs,
-  senderNumber, senderDisplayId, senderName, senderJid, sender, body,
-  isAdmin, senderTier
-}
-```
-`senderTier` is one of `permissions.TIERS.CREATOR / ADMIN / PUBLIC` —
-always use this instead of re-deriving tier logic.
-
-**Your `handleAdminCommand` does NOT need to do anything for game
-switching.** `setgame` / `setadminaccess` / `status` are handled entirely
-by `index.js` under the fixed `/game` prefix, before your game's admin
-prefix is even checked — so a new game's `adminCommands.js` never touches
-`game-switch-commands.js` at all. This is intentional: it means the
-creator can always type `/game setgame [key]` regardless of which game
-(or which prefix) is currently active, instead of needing to remember
-the active game's own acronym first.
-
-Also respect the admin scope near the top of your "admin-only" command
-block (mirrors Hangman's implementation):
-```js
-if (!senderIsCreator) {
-    const scope = settings.adminGameAccess || 'all'
-    if (scope !== 'all' && scope !== config.GAME_KEY) return
-}
-```
-
-### `matchSummary.js` (optional but recommended)
-Not required by the registry contract, but keeping bookkeeping /
-"who won, who's out, final report" logic in its own file (like Hangman
-does) keeps `gameEngine.js` and `publicCommands.js` readable.
+**See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full, authoritative
+contract** (exact required exports, the state-isolation rule, the
+authorization-gate rule, and the failure modes each rule prevents). Short
+version: drop a folder with `config.js` + `gameEngine.js` +
+`adminCommands.js` (+ `publicCommands.js`) in the project root, following
+the shapes documented there — `games-registry.js` auto-discovers it, no
+other file changes.
 
 ---
 
@@ -195,9 +129,16 @@ the active game's prefix again?" just to switch away from it.
 
 ## 5. Games built so far
 
+| Game | Key | Public prefix | Admin prefix |
+|---|---|---|---|
+| HangMan Game | `hangman` | `!hmg` | `/hmg ` |
+| Word Ladder Game | `wordladder` | `!wlg` | `/wlg ` |
+| Word Chain Game | `wordchain` | `!wcg` | `/wcg ` |
+| Target Numbers | `target` | `!tgt` | `/tgt ` |
+| The 24 Game | `m4th` | `!m4th` | `/m4th ` |
+| Momentum | `momentum` | `!mmt` | `/mmt ` |
+
 ### HangMan Game (HMG)
-- Renamed WRG → **HMG ("HangMan Game")** everywhere; acronym/name are
-  single constants in `HangmanGame/config.js`.
 - Adaptive word-length difficulty — one flat word pool, target length drifts
   ±1 per round based on group performance (`gameEngine.adjustNextWordLength`).
 - 2-minute post-round cooldown with automatic fresh lobby — no admin action needed.
@@ -206,13 +147,16 @@ the active game's prefix again?" just to switch away from it.
 
 ### Word Ladder Game (WLG)
 - BFS engine (`bfsSolve`) finds the shortest valid transformation path
-  between any two words in a 1,400+ word dictionary.
-- 5 built-in themes: `general`, `animals`, `food`, `nature`, `tech` —
-  each with hand-picked, BFS-verified puzzle pairs and witty hints.
-- Adaptive difficulty — word length drifts ±1 based on solve speed and
+  between any two words in a themed dictionary.
+- 5 built-in themes: `general`, `animals`, `food`, `nature`, `tech`.
+- Adaptive difficulty — word length drifts based on solve speed and
   consecutive timeouts, same single-signal pattern as HMG.
-- 90-second cooldown between rounds; hints reveal only the changed letter
-  position, not the full answer.
+
+### Word Chain, Target Numbers, The 24 Game, Momentum
+Each follows the same plugin contract (`ARCHITECTURE.md`) with its own
+gameplay loop, word/number pools, and admin command set — see each
+folder's own comments for gameplay specifics. All four were audited and
+had bugs fixed in this pass — see `reports/CHANGE_LOG.md` for the full list.
 
 ---
 

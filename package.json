@@ -1,0 +1,25 @@
+{
+  "name": "whatsapp-game-bots",
+  "version": "2.0.0",
+  "description": "Pluggable multi-game WhatsApp bot (Baileys) — HangMan, Word Ladder, Word Chain, Target Numbers, The 24 Game, Momentum.",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "verify": "node scripts/verify-games.js",
+    "prestart": "node scripts/verify-games.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
+    "dotenv": "^17.4.2",
+    "qrcode-terminal": "^0.12.0",
+    "word-list": "^4.0.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

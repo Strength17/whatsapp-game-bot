@@ -69,27 +69,27 @@ async function handleAdminCommand(ctx) {
             if (!['easy', 'normal', 'difficult'].includes(arg2)) {
                 return reply(`Usage: */wcg set difficulty easy|normal|difficult*`)
             }
-            writeSetting(tier, 'difficulty', arg2, settings)
+            writeSetting(tier, `${config.GAME_KEY}_difficulty`, arg2, settings)
             saveSettings()
             return reply(`✅ Difficulty set to ${difficultyBadge(arg2)}. Takes effect next round.`)
         }
         if (arg1 === 'strikes') {
             const n = parseInt(arg2, 10)
             if (!Number.isInteger(n) || n < 1) return reply(`Usage: */wcg set strikes <number, 1 or more>*`)
-            writeSetting(tier, 'maxStrikes', n, settings)
+            writeSetting(tier, `${config.GAME_KEY}_maxStrikes`, n, settings)
             saveSettings()
             return reply(`✅ Max strikes set to *${n}*. Takes effect next round.`)
         }
         if (arg1 === 'timer') {
             if (arg2 === 'auto') {
-                writeSetting(tier, 'timerSeconds', 'auto', settings)
+                writeSetting(tier, `${config.GAME_KEY}_timerSeconds`, 'auto', settings)
                 saveSettings()
                 return reply(`✅ Turn timer reset to automatic (difficulty-based).`)
             }
             const n = parseInt(arg2, 10)
             if (!Number.isInteger(n)) return reply(`Usage: */wcg set timer <seconds>* or */wcg set timer auto*`)
             if (n < config.MIN_TIMER_SECONDS) return reply(`⚠️ ${config.MIN_TIMER_SECONDS}s is the minimum (connection reliability) — setting to ${config.MIN_TIMER_SECONDS}s instead.`)
-            writeSetting(tier, 'timerSeconds', Math.max(config.MIN_TIMER_SECONDS, n), settings)
+            writeSetting(tier, `${config.GAME_KEY}_timerSeconds`, Math.max(config.MIN_TIMER_SECONDS, n), settings)
             saveSettings()
             return reply(`✅ Turn timer set to *${Math.max(config.MIN_TIMER_SECONDS, n)}s*. Takes effect next round.`)
         }
@@ -177,9 +177,9 @@ async function handleAdminCommand(ctx) {
     }
 
     if (cmd[0] === 'status') {
-        const difficulty = resolveSetting('difficulty', settings, 'easy')
-        const timer      = resolveSetting('timerSeconds', settings, 'auto')
-        const strikes    = resolveSetting('maxStrikes', settings, config.DEFAULT_MAX_STRIKES)
+        const difficulty = resolveSetting(`${config.GAME_KEY}_difficulty`, settings, 'easy')
+        const timer      = resolveSetting(`${config.GAME_KEY}_timerSeconds`, settings, 'auto')
+        const strikes    = resolveSetting(`${config.GAME_KEY}_maxStrikes`, settings, config.DEFAULT_MAX_STRIKES)
         const gs = getGameState(sender, games)
         return reply(
             `📊 *Word Chain Status*\n\n` +

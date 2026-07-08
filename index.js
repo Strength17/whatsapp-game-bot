@@ -22,15 +22,51 @@ const { handleGameSwitchCommands } = require('./game-switch-commands')
 const GAME_SWITCH_PREFIX = '/game '
 
 // ─── Safe DM sender ───────────────────────────────────────
+// Contract every game module relies on: sendSafeMessage(sock, jidOrNumber, payload)
+// where payload is a Baileys message object, e.g. { text: '...' }.
+// This function NEVER throws — a malformed call from a game module (wrong
+// arg order, a raw string instead of a jid, a raw string instead of a
+// payload object) is normalized or logged, never allowed to become an
+// uncaught exception that could take the whole bot down.
 async function sendSafeMessage(sock, jidOrNumber, payload) {
-    const targetJid = jidOrNumber.includes('@') ? jidOrNumber : `${jidOrNumber}@s.whatsapp.net`
     try {
-        const result = await sock.sendMessage(targetJid, payload)
-        console.log(`[sendSafe] Sent to ${targetJid}:`, JSON.stringify(result?.key))
+        if (!sock || typeof sock.sendMessage !== 'function') {
+            console.log(`[sendSafe] ❌ Called with an invalid sock (got ${typeof sock}). Check the caller's argument order — expected sendSafeMessage(sock, jid, payload).`)
+            return null
+        }
+        if (typeof jidOrNumber !== 'string' || !jidOrNumber) {
+            console.log(`[sendSafe] ❌ Called with an invalid jid/number (got ${typeof jidOrNumber}). Check the caller's argument order.`)
+            return null
+        }
+        const safePayload = (typeof payload === 'string') ? { text: payload } : payload
+        if (!safePayload || typeof safePayload !== 'object') {
+            console.log(`[sendSafe] ❌ Called with an invalid payload (got ${typeof payload}) for ${jidOrNumber}.`)
+            return null
+        }
+
+        const targetJid = jidOrNumber.includes('@') ? jidOrNumber : `${jidOrNumber}@s.whatsapp.net`
+        const result = await sock.sendMessage(targetJid, safePayload)
+        return result
     } catch (err) {
-        console.log(`[sendSafe] Send error to ${targetJid}:`, err.message)
+        console.log(`[sendSafe] Send error to ${jidOrNumber}:`, err.message)
+        return null
     }
 }
+
+// ─── Last-resort safety net ─────────────────────────────────
+// A bug in any single game module (bad message payload, a rejected
+// promise from a timer callback, etc.) must never crash the entire
+// bot process. Everything actionable is still funneled through
+// per-message try/catch in the message handler below — these are the
+// final backstop for anything that slips past that (e.g. errors thrown
+// inside setTimeout/setInterval callbacks, which can't be caught by a
+// try/catch around the triggering message).
+process.on('unhandledRejection', (err) => {
+    console.log('🛑 [unhandledRejection] Bot stayed alive. Error:', err && err.stack || err)
+})
+process.on('uncaughtException', (err) => {
+    console.log('🛑 [uncaughtException] Bot stayed alive. Error:', err && err.stack || err)
+})
 
 // ─── Persistent Settings ───────────────────────────────────
 const SETTINGS_FILE = 'settings.json'
@@ -356,16 +392,20 @@ async function startBot() {
                 }
             }
 
-            // Recover active game/lobby/cooldown after restart
-            if (activeGameChatRef.value && games[activeGameChatRef.value] && activeGame) {
-                const gs  = games[activeGameChatRef.value]
+            // Recover active game/lobby/cooldown after restart.
+            // Always go through the active game's own getGameState() rather
+            // than indexing `games[...]` directly — different game modules
+            // store state under different (namespaced) keys, and this code
+            // must not assume any particular one.
+            if (activeGameChatRef.value && activeGame && typeof activeGame.gameEngine.getGameState === 'function') {
+                const gs  = activeGame.gameEngine.getGameState(activeGameChatRef.value, games)
                 const ctx = buildCtx(sock)
-                if (gs.lobbyActive) {
+                if (gs.lobbyActive && typeof activeGame.gameEngine.startLobbyCountdown === 'function') {
                     await sock.sendMessage(activeGameChatRef.value, {
                         text: `🔁 *Bot restarted.* Resuming the lobby countdown (${gs.lobbySecondsLeft}s left). Type *${activeGame.config.PREFIX} join* if you haven't! ⏱️`
                     })
                     activeGame.gameEngine.startLobbyCountdown(activeGameChatRef.value, ctx)
-                } else if (gs.active && !gs.paused) {
+                } else if (gs.active && !gs.paused && typeof activeGame.gameEngine.sendGameBoard === 'function') {
                     await sock.sendMessage(activeGameChatRef.value, { text: `🔁 *Bot restarted.* Resuming the in-progress round. 🎮` })
                     await activeGame.gameEngine.sendGameBoard(activeGameChatRef.value, '🔁 *Round recovered after a restart.*', [], ctx)
                 } else if (gs.active && gs.paused) {
@@ -375,6 +415,9 @@ async function startBot() {
                 } else if (gs.cooldownActive && typeof activeGame.gameEngine.startCooldown === 'function') {
                     await sock.sendMessage(activeGameChatRef.value, { text: `🔁 *Bot restarted.* Still on the post-round break. ☕` })
                     activeGame.gameEngine.startCooldown(activeGameChatRef.value, ctx)
+                } else if (gs.active) {
+                    // Game doesn't expose sendGameBoard — still let players know it's alive.
+                    await sock.sendMessage(activeGameChatRef.value, { text: `🔁 *Bot restarted.* The round in progress should continue normally. 🎮` })
                 }
             }
         }
@@ -385,6 +428,7 @@ async function startBot() {
         if (type !== 'notify') return
 
         for (const msg of messages) {
+          try {
             if (!msg.message) continue
             if (isDuplicateMessage(msg.key?.id)) {
                 console.log(`[dedup] Skipping duplicate: ${msg.key.id}`)
@@ -531,6 +575,12 @@ async function startBot() {
                 from, body, rawBody, senderNumber, senderJid, senderName, isAdmin
             }
             await handler(msgCtx)
+          } catch (err) {
+            // A crash inside ONE message's handling (any game module,
+            // any command) must never kill the messages.upsert listener
+            // or the bot process — log it and move on to the next message.
+            console.log(`🛑 [message-handler] Error handling a message — bot stayed alive:`, err && err.stack || err)
+          }
         }
     })
 }

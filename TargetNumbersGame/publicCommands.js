@@ -27,7 +27,26 @@ async function handlePublicMessage(msgCtx) {
     if (lower.startsWith(config.PREFIX)) {
         const rest = text.slice(config.PREFIX.length).trim().toLowerCase()
 
-        if (rest === '' || rest === 'start') {
+        // Bare "!tgt" with no subcommand must always explain the game —
+        // never silently attempt to start it. See ARCHITECTURE.md §10.
+        if (rest === '') {
+            await sock.sendMessage(from, {
+                text:
+                    `🎯 *${config.GAME_NAME} (${config.GAME_ACRONYM})*\n\n` +
+                    `Each round gives 6 numbers and a 3-digit target. Combine any of the ` +
+                    `numbers (don't have to use them all, each only as many times as it appears) ` +
+                    `with \`+ − × ÷\` — every step must stay a positive whole number, no fractions. ` +
+                    `Just type your equation while a round is open. Exact hit ends the round instantly; ` +
+                    `otherwise the closest submission wins when time's up!\n\n` +
+                    `*${config.PREFIX} start* — begin a session\n` +
+                    `*${config.PREFIX} scores* — show current standings\n` +
+                    `*${config.PREFIX} hint* — get a partial hint for the live round\n` +
+                    `*${config.PREFIX} help* — show this again`
+            })
+            return true
+        }
+
+        if (rest === 'start') {
             const publicCanStart = resolveSetting('publicCanStart', settings, false)
             if (!isAdmin && !publicCanStart) {
                 await sock.sendMessage(from, { text: `🚫 Only an admin can start *${config.GAME_NAME}* right now.` })

@@ -25,7 +25,25 @@ async function handlePublicMessage(msgCtx) {
     if (lower.startsWith(config.PREFIX)) {
         const rest = text.slice(config.PREFIX.length).trim().toLowerCase()
 
-        if (rest === '' || rest === 'start') {
+        // Bare "!m4th" with no subcommand must always explain the game —
+        // never silently attempt to start it. See ARCHITECTURE.md §10.
+        if (rest === '') {
+            await sock.sendMessage(from, {
+                text:
+                    `🧮 *${config.GAME_NAME} (${config.GAME_ACRONYM})*\n\n` +
+                    `Each round gives 4 numbers. Combine ALL 4 using \`+ − × ÷\` ` +
+                    `(any order, any grouping, parentheses allowed) to make exactly *24*. ` +
+                    `Just type your equation directly — no prefix needed once a round is live. ` +
+                    `First correct answer wins the round! 🏆\n\n` +
+                    `*${config.PREFIX} start* — begin a session\n` +
+                    `*${config.PREFIX} scores* — show current standings\n` +
+                    `*${config.PREFIX} hint* — get a partial hint for the live round\n` +
+                    `*${config.PREFIX} help* — show this again`
+            })
+            return true
+        }
+
+        if (rest === 'start') {
             const publicCanStart = resolveSetting('publicCanStart', settings, false)
             if (!isAdmin && !publicCanStart) {
                 await sock.sendMessage(from, { text: `🚫 Only an admin can start *${config.GAME_NAME}* right now.` })

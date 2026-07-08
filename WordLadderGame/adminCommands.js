@@ -13,10 +13,16 @@ const THEME_EMOJI = {
 
 async function handleAdminCommand(ctx) {
     const {
-        sock, games, settings, persistGames, saveSettings, sendSafeMessage,
-        senderNumber, senderDisplayId, senderName, senderJid, from, body,
+        sock, games, settings, persistGames, saveSettings, sendSafeMessage: _sendSafeMessage,
+        senderNumber, senderDisplayId, senderName, senderJid, sender: from, body,
         isAdmin, senderTier, nameCache,
     } = ctx;
+
+    // Shared contract is sendSafeMessage(sock, jid, payload) — shim to the
+    // local (jid, text) convention used throughout this file. See the same
+    // note in publicCommands.js.
+    const sendSafeMessage = (jid, text) =>
+        _sendSafeMessage(sock, jid, typeof text === 'string' ? { text } : text);
 
     // ── Admin scope guard (mirrors README contract) ───────────────────────
     const permissions = require('../permissions');

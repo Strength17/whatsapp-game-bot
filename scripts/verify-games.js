@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================================
-//  scripts/verify-games.js — HMG Bot · Sky Graphics
+//  scripts/verify-games.js — GAME Bot · Sky Graphics
 //
 //  Run this before every deploy (it also runs automatically via
 //  `npm start`'s "prestart" hook — see package.json). Exits non-zero
@@ -48,7 +48,7 @@ function warn(msg) { warnings++; console.log(`⚠️  WARN: ${msg}`) }
 function ok(msg)   { console.log(`✅ ${msg}`) }
 
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
-console.log('  HMG Bot — pre-deploy verification')
+console.log('  GAME Bot — pre-deploy verification')
 console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n')
 
 // The whole script body runs inside this async IIFE so check 6 (below)

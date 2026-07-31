@@ -1,51 +1,55 @@
-# WhatsApp Bots · Sky Graphics
+# WhatsApp Game Bots · Sky Graphics
 
-A WhatsApp game bot (built on Baileys) that currently runs **six games** —
-HangMan (HMG), Word Ladder (WLG), Word Chain (WCG), Target Numbers (TGT),
-The 24 Game (M4T), and Momentum (MMT) — with a pluggable structure so the
-creator can add and switch between them without touching the core bot.
+A WhatsApp game bot (built on Baileys) with a pluggable structure — the
+creator can add and switch between games without touching the core bot.
+Currently runs **two games**: **Hangman** (`hangman`) and **Word Climb**
+(`wordclimb`).
 
-**→ For the exact plugin contract every game folder must follow (and why),
-see [`ARCHITECTURE.md`](./ARCHITECTURE.md).** That file is the canonical
-spec — this README is the tour. If you're building a new game (or handing
-this to another AI to build one), read `ARCHITECTURE.md` first.
+**→ Building a new game? Read [`ARCHITECTURE.md`](./ARCHITECTURE.md)
+first.** That's the canonical plugin contract — this file is the tour.
 
-**→ Before every deploy, run `npm run verify`** (see `scripts/verify-games.js`).
+**→ Want every command, the message-format conventions, and the file
+layout in one place? Read [`COMMAND_REFERENCE.md`](./COMMAND_REFERENCE.md).**
+This README won't repeat what's there.
+
+**→ Before every deploy, run `npm run verify`** (`scripts/verify-games.js`).
 It catches missing dependencies, unwired game folders, broken contracts,
-and state-isolation bugs before Railway (or any host) ever sees them —
-see `reports/CHANGE_LOG.md` for the real incident this was built from.
+and state-isolation bugs before any host sees them.
 
-This file is written so it can be handed to **another AI** (or another
-developer) to build any new game and have it merge in with **zero changes
-to any existing file**.
+This project is written so it can be handed to **another AI** (or another
+developer) to build a new game with **zero changes to any existing game
+folder** — only the shared root files (`index.js`, `admin-onboarding.js`,
+`game-switch-commands.js`, `games-registry.js`) are meant to be touched
+across the whole project's lifetime, and even those only for genuinely
+game-agnostic concerns.
 
 ---
 
 ## 1. Project structure
 
 ```
-/index.js                 ← root orchestrator ONLY: connection, sender
-                             resolution (LID/PN), message routing.
-                             Contains no game-specific logic or strings.
-/permissions.js            ← shared, game-agnostic: CREATOR/ADMIN/PUBLIC
-                             tier resolution, setting overrides, name tags.
-/games-registry.js          ← auto-discovers EVERY game folder at boot
-                             (scans the project root — nothing hardcoded).
-/game-switch-commands.js    ← shared creator-only commands (setgame,
-                             setadminaccess, status), invoked directly by
-                             index.js under the FIXED "/game" prefix —
-                             never under any individual game's own prefix.
-/package.json               ← REQUIRED — see ARCHITECTURE.md §7.
-/scripts/verify-games.js    ← pre-deploy check, also runs via `npm start`.
-/README.md                  ← this file.
-/ARCHITECTURE.md            ← the plugin contract — read this to add a game.
+/index.js                  ← root orchestrator ONLY: connection, sender
+                              resolution (LID/PN), message routing.
+                              Contains no game-specific logic or strings.
+/permissions.js             ← shared, game-agnostic: CREATOR/ADMIN/PUBLIC
+                              tier resolution, setting overrides, name tags.
+/admin-onboarding.js         ← "/admin ..." — bot-wide admin IDENTITY:
+                              who is the admin, and which game(s) they
+                              may operate. Fixed prefix, independent of
+                              which game is currently active.
+/game-switch-commands.js     ← "/game ..." — which game is currently
+                              active, and the confirmed admin's scope.
+                              Also a fixed prefix.
+/games-registry.js           ← auto-discovers EVERY game folder at boot
+                              (scans the project root — nothing hardcoded).
+/package.json                ← REQUIRED — see ARCHITECTURE.md §7.
+/scripts/verify-games.js      ← pre-deploy check, also runs via `npm start`.
+/README.md                    ← this file.
+/ARCHITECTURE.md              ← the plugin contract — read this to add a game.
+/COMMAND_REFERENCE.md          ← every command, message shape, file layout.
 
 /HangmanGame/       ← !hmg / /hmg
-/WordLadderGame/    ← !wlg / /wlg
-/WordChainGame/     ← !wcg / /wcg
-/TargetNumbersGame/ ← !tgt / /tgt
-/TwentyFourGame/    ← !m4th / /m4th
-/MomentumGame/      ← !mmt / /mmt
+/WordClimbGame/     ← !wcl / /wcl
 
 /<AnyNewGame>/              ← next game goes here; see ARCHITECTURE.md
     config.js
@@ -53,8 +57,7 @@ to any existing file**.
     publicCommands.js
     adminCommands.js
     matchSummary.js         ← optional but recommended
-
-/reports/                    ← human-facing docs (see reports/README.md)
+    README.md               ← that game's own rules + commands
 ```
 
 **Runtime files** (created automatically, not shipped in this zip):
@@ -63,7 +66,7 @@ to any existing file**.
 
 ---
 
-## 2. Settings that are now game-agnostic
+## 2. Settings that are game-agnostic
 
 `settings.json` (root-level, shared across every game):
 
@@ -71,59 +74,49 @@ to any existing file**.
 {
   "adminNumber": "",
   "adminJid": "",
-  "maxTries": "auto",
-  "publicVisible": true,
-  "publicCanStart": false,
   "activeGame": "hangman",        // which game folder is currently live
-  "adminGameAccess": "all"        // "all" or a specific GAME_KEY
+  "adminGameAccess": "all",       // "all" or a specific GAME_KEY
+  "showRoleTags": true,           // bot-wide (Creator)/(Admin) name tag
+  "publicVisible": true,
+  "publicCanStart": false
+  // + any game-specific keys, namespaced by that game's GAME_KEY,
+  // e.g. "wordclimb_turnSeconds" — see each game's config.js
 }
 ```
 
 - `activeGame` — read by `games-registry.getActiveGame()`. Only the
-  **creator** can change it, via `/game setgame [key]` — a fixed prefix,
-  independent of whichever game is currently active.
-- `adminGameAccess` — scopes the confirmed **admin** (not the creator) to
-  one game or `all`. The creator is never restricted by this.
+  **creator** can change it, via `/game setgame [key]`.
+- `adminNumber` / `adminJid` / `adminGameAccess` — bot-wide admin
+  identity, set via `/admin` (see `admin-onboarding.js`) — **never**
+  from inside an individual game's own admin commands.
 
 ---
 
 ## 3. The plugin contract — summary
 
 **See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full, authoritative
-contract** (exact required exports, the state-isolation rule, the
-authorization-gate rule, and the failure modes each rule prevents). Short
-version: drop a folder with `config.js` + `gameEngine.js` +
-`adminCommands.js` (+ `publicCommands.js`) in the project root, following
-the shapes documented there — `games-registry.js` auto-discovers it, no
-other file changes.
+contract.** Short version: drop a folder with `config.js` +
+`gameEngine.js` + `adminCommands.js` + `publicCommands.js` in the
+project root, following the shapes documented there —
+`games-registry.js` auto-discovers it, no other file changes.
 
 ---
 
-## 4. How switching games works end-to-end
+## 4. How admin identity and game switching work end-to-end
 
-`/game` is a **fixed prefix**, always available, regardless of which
-game is currently active or what that game's own acronym is. This is
-deliberate — the creator should never have to remember "wait, what's
-the active game's prefix again?" just to switch away from it.
+Two separate, fixed, game-independent prefixes — neither lives inside
+any individual game's folder:
 
-1. Creator types `/game setgame [key]` — works regardless of which game
-   is currently active.
-2. `index.js` intercepts this before resolving the active game at all,
-   and hands it to `game-switch-commands.js`, which looks up `[key]`
-   in the registry. If `[GameFolder]/config.js` exists and loaded
-   cleanly, it sets `settings.activeGame = '[key]'` and saves.
-3. From that point on, every inbound message is routed by `index.js`
-   using `registry.getActiveGame(settings)` — which now resolves to the
-   new game module. Its `PREFIX`/`ADMIN_PREFIX` from `config.js` take
-   over immediately for everything else (gameplay, that game's own admin
-   commands), no restart needed.
-4. The creator switches back to any other game with `/game setgame [key]`
-   — same fixed prefix, never the active game's own acronym.
-5. `/game setadminaccess [key]` (creator-only) restricts the current
-   admin to only operating that specific game; `/game setadminaccess all`
-   removes the restriction.
-6. `/game status` (creator or admin) shows the active game, the admin's
-   current scope, and every game key available in the registry.
+- **`/admin`** answers *"who is allowed to run admin commands, and for
+  which game(s)"* — bot identity. Request access, redeem a key, or have
+  the creator assign someone directly with `/admin set [num] [gamekey|all]`.
+- **`/game`** answers *"which game is currently live, and what can the
+  current admin touch"* — bot configuration. `/game setgame [key]`
+  switches games (cleanly stopping any live session first, if the
+  outgoing game supports it); `/game setadminaccess [gamekey|all]`
+  scopes the admin; `/game status` shows both at a glance.
+
+Full command tables for both: [`COMMAND_REFERENCE.md`](./COMMAND_REFERENCE.md) §1.
 
 ---
 
@@ -131,37 +124,34 @@ the active game's prefix again?" just to switch away from it.
 
 | Game | Key | Public prefix | Admin prefix |
 |---|---|---|---|
-| HangMan Game | `hangman` | `!hmg` | `/hmg ` |
-| Word Ladder Game | `wordladder` | `!wlg` | `/wlg ` |
-| Word Chain Game | `wordchain` | `!wcg` | `/wcg ` |
-| Target Numbers | `target` | `!tgt` | `/tgt ` |
-| The 24 Game | `m4th` | `!m4th` | `/m4th ` |
-| Momentum | `momentum` | `!mmt` | `/mmt ` |
+| Hangman | `hangman` | `!hmg` | `/hmg ` |
+| Word Climb | `wordclimb` | `!wcl` | `/wcl ` |
 
-### HangMan Game (HMG)
-- Adaptive word-length difficulty — one flat word pool, target length drifts
-  ±1 per round based on group performance (`gameEngine.adjustNextWordLength`).
-- 2-minute post-round cooldown with automatic fresh lobby — no admin action needed.
-- Per-player DM stick figures: private ASCII art (plain text) showing
-  remaining lives after each wrong guess.
+### Hangman (HMG)
+Classic single-word elimination, adapted for a live group chat.
+- Adaptive word-length difficulty — target length drifts based on group
+  performance round to round (`gameEngine.adjustNextWordLength`).
+- 2-minute post-round cooldown with an automatic fresh lobby — no admin
+  action needed between matches.
+- Per-player stick-figure elimination card, posted live in the **group**
+  (not a DM) and tagged with that player's name + strike count, the
+  moment they miss a guess.
+- Full rules + command list: [`HangmanGame/README.md`](./HangmanGame/README.md).
 
-### Word Ladder Game (WLG)
-- BFS engine (`bfsSolve`) finds the shortest valid transformation path
-  between any two words in a themed dictionary.
-- 5 built-in themes: `general`, `animals`, `food`, `nature`, `tech`.
-- Adaptive difficulty — word length drifts based on solve speed and
-  consecutive timeouts, same single-signal pattern as HMG.
-
-### Word Chain, Target Numbers, The 24 Game, Momentum
-Each follows the same plugin contract (`ARCHITECTURE.md`) with its own
-gameplay loop, word/number pools, and admin command set — see each
-folder's own comments for gameplay specifics. All four were audited and
-had bugs fixed in this pass — see `reports/CHANGE_LOG.md` for the full list.
+### Word Climb (WCL)
+Turn-based elimination — the required word length escalates a rung at
+a time (3→8 letters), 3 strikes and you're out.
+- Full rules + command list: [`WordClimbGame/README.md`](./WordClimbGame/README.md).
 
 ---
 
-## 6. Not carried over from the previous report set
+## 6. Adding a new game
 
-The earlier `WRG_Bot_File_Summary.md` was intentionally dropped — it was
-a strict subset of the other reports with nothing unique. See
-`reports/README.md` for what's kept and why.
+1. Read `ARCHITECTURE.md` end to end.
+2. Create `<NewGame>/` with the required files (see §1 above).
+3. Give it its own `GAME_KEY` / `PREFIX` / `ADMIN_PREFIX` in `config.js`
+   — no other file needs to know it exists.
+4. Write `<NewGame>/README.md` following the same shape as
+   `HangmanGame/README.md` or `WordClimbGame/README.md`.
+5. Run `npm run verify` before deploying. It checks the contract, state
+   isolation, and the bare-acronym rule automatically.

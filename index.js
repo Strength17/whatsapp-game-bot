@@ -15,11 +15,13 @@ const path = require('path')
 const registry = require('./games-registry')
 const { getTier, TIERS, resolveSetting } = require('./permissions')
 const { handleGameSwitchCommands } = require('./game-switch-commands')
+const { handleAdminOnboarding, ensureInactivityTimerRunning } = require('./admin-onboarding')
 
 // Fixed, game-independent prefix. Always works no matter which game is
 // currently active, so the creator never needs to know/guess the active
 // game's own acronym just to switch away from it.
 const GAME_SWITCH_PREFIX = '/game '
+const ADMIN_ONBOARDING_PREFIX = '/admin'
 
 // ─── Safe DM sender ───────────────────────────────────────
 // Contract every game module relies on: sendSafeMessage(sock, jidOrNumber, payload)
@@ -84,7 +86,10 @@ let settings = {
     showRoleTags:     true         // bot-wide (Creator)/(Admin) tag on nameTag(), see permissions.js
 }
 
-let pendingAdminChangeRef = { value: null }
+// Note: pending admin-change state used to live here as a shared ref
+// passed into every game's admin ctx. It's now fully owned inside
+// admin-onboarding.js (module-level, alongside pendingKeys etc.) since
+// "/admin set/confirm/cancel" is the only thing that touches it.
 
 if (fs.existsSync(SETTINGS_FILE)) {
     settings = JSON.parse(fs.readFileSync(SETTINGS_FILE))
@@ -295,6 +300,13 @@ async function startBot() {
             const activeGame = registry.getActiveGame(settings)
             console.log(`✅ HMG Bot is connected! Active game: ${activeGame ? activeGame.config.GAME_NAME : 'NONE LOADED'} 🎮`)
 
+            // Resume the 30-day admin-inactivity clock on restart, if an
+            // admin is already configured — this used to only happen as
+            // a side effect of Hangman's own /hmg admin handler running,
+            // which meant it silently never started at all on a fresh
+            // boot until someone typed a Hangman-specific command.
+            ensureInactivityTimerRunning(settings, saveSettings, sock, sendSafeMessage)
+
             // Seed LID↔PN mappings from every available source on boot.
             ;(async () => {
                 const creatorJidEnv = process.env.CREATOR_JID || ''
@@ -494,6 +506,24 @@ async function startBot() {
             const senderTier = getTier(senderNumber, settings, senderJid)
             const isAdmin    = senderTier === TIERS.CREATOR || senderTier === TIERS.ADMIN
 
+            // ── "/admin ..." — fixed, game-independent onboarding ──
+            // Checked BEFORE "/game" and before active-game resolution,
+            // for the exact same reason "/game" is: it must work no
+            // matter which game is currently active, or whether any
+            // admin exists yet at all. See admin-onboarding.js header
+            // for why this used to live inside HangmanGame specifically
+            // (a real bug — it silently broke on any other active game).
+            if (body === ADMIN_ONBOARDING_PREFIX || body.startsWith(ADMIN_ONBOARDING_PREFIX + ' ')) {
+                const raw = body.slice(ADMIN_ONBOARDING_PREFIX.length).trim()
+                const cmd = raw.length ? raw.split(/\s+/) : []
+                await handleAdminOnboarding({
+                    sock, settings, saveSettings, sendSafeMessage,
+                    senderNumber, senderJid, senderName, senderTier,
+                    cmd, activeGame: registry.getActiveGame(settings)
+                })
+                continue
+            }
+
             // ── "/game ..." — fixed, game-independent switch commands ──
             // Checked BEFORE active-game resolution so it works no matter
             // which game is currently running, and no matter what that
@@ -548,7 +578,6 @@ async function startBot() {
             if (body.startsWith(adminPrefix)) {
                 const cmdCtx = {
                     ...buildCtx(sock),
-                    pendingAdminChangeRef,
                     saveSettings,
                     saveWords,
                     sendSafeMessage,

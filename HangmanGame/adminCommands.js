@@ -4,107 +4,21 @@
 //
 //  Access tiers:
 //    CREATOR  — CREATOR_JID in .env. Unrestricted. Always works.
-//    ADMIN    — set via key onboarding. Full command access.
+//    ADMIN    — set via /admin key onboarding. Full command access.
 //    EVERYONE ELSE — total silence on all "/" commands.
 //
-//  /hmg admin  — onboarding gate (key request → creator approves → key sent)
 //  /hmg help   — admin/creator dashboard, DM only, silent to all others
-//  /hmg approve [number] — creator only: sends approved key to requester
-//  /hmg deny   [number] — creator only: immediately voids the key
+//  Admin identity onboarding (/admin, /admin approve, /admin deny) is
+//  NOT handled here anymore — see admin-onboarding.js at the project
+//  root. It's a fixed, game-independent prefix, same as "/game ...".
 //  Game switching (/game setgame, /game setadminaccess) is NOT handled
-//  in this file — it's a fixed, game-independent prefix in index.js.
+//  in this file either — also a fixed, game-independent prefix.
 // ============================================================
-
-const crypto = require('crypto')
 
 const { TIERS, writeSetting, resolveSetting, nameTag } = require('../permissions')
 const { startActualGame, openFreshLobby } = require('./gameEngine')
 const config = require('./config')
 
-// ─── Pending key sessions ────────────────────────────────────
-const pendingKeys = {}
-const approvalQueue = {}
-const voidedSessions = {}
-const VOIDED_LOCKOUT_MS = 30 * 60 * 1000
-
-const adminRateLimit = {}
-
-let adminLastActive = 0
-let adminInactivityTimer = null
-
-function generateKey() {
-    return crypto.randomUUID()
-}
-
-function cleanExpiredKeys() {
-    const now = Date.now()
-    for (const jid in pendingKeys) {
-        if (pendingKeys[jid].expiresAt < now) {
-            const num = pendingKeys[jid].senderNumber
-            delete pendingKeys[jid]
-            delete approvalQueue[num]
-        }
-    }
-    for (const num in voidedSessions) {
-        if (voidedSessions[num].voidedAt + VOIDED_LOCKOUT_MS < now) {
-            delete voidedSessions[num]
-        }
-    }
-}
-
-function checkAdminRateLimit(senderNumber) {
-    const now = Date.now()
-    const entry = adminRateLimit[senderNumber] || { count: 0, lockedUntil: 0 }
-
-    if (now < entry.lockedUntil) return true
-    if (entry.lockedUntil && now >= entry.lockedUntil) {
-        entry.count = 0
-        entry.lockedUntil = 0
-    }
-    entry.count++
-    if (entry.count >= 5) {
-        entry.lockedUntil = now + 10 * 60 * 1000
-        entry.count = 0
-    }
-    adminRateLimit[senderNumber] = entry
-    return false
-}
-
-function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage) {
-    if (adminInactivityTimer) clearInterval(adminInactivityTimer)
-    adminLastActive = Date.now()
-
-    adminInactivityTimer = setInterval(async () => {
-        if (!settings.adminNumber) {
-            clearInterval(adminInactivityTimer)
-            adminInactivityTimer = null
-            return
-        }
-        const thirtyDays = 30 * 24 * 60 * 60 * 1000
-        if (Date.now() - adminLastActive >= thirtyDays) {
-            clearInterval(adminInactivityTimer)
-            adminInactivityTimer = null
-
-            const cleared = settings.adminNumber
-            settings.adminNumber = ''
-            settings.adminJid    = ''
-            saveSettings()
-
-            const creatorJid = process.env.CREATOR_JID || ''
-            if (creatorJid) {
-                try {
-                    await sendSafeMessage(sock, creatorJid, {
-                        text:
-                            `⚠️ *Admin Slot Auto-Cleared*\n\n` +
-                            `${cleared} has been inactive for *30 days* — the admin slot has been reset.\n\n` +
-                            `The bot is now unconfigured. The next */hmg admin* request will begin fresh onboarding. 🚀`
-                    })
-                } catch (_) {}
-            }
-            console.log(`[inactivity] Admin slot cleared — ${cleared} inactive for 30 days.`)
-        }
-    }, 60 * 60 * 1000)
-}
 
 function formatMaxTries(value) {
     if (value === 'auto' || value === undefined || value === null) return 'AUTO 🤖'
@@ -197,8 +111,8 @@ function buildHelpText(settings, forCreator = false, section = null) {
             `› \`/hmg end\` · \`/hmg stop\` — terminate active game\n` +
             (forCreator
                 ? `\n*🔐  Creator-Only:*\n` +
-                  `› \`/hmg approve [number]\` — send access key to requester\n` +
-                  `› \`/hmg deny [number]\` — void their key immediately\n` +
+                  `› \`/admin approve [number]\` — send access key to requester\n` +
+                  `› \`/admin deny [number]\` — void their key immediately\n` +
                   `› \`/game setgame [key]\` — switch the active game (fixed prefix, works from any game)\n` +
                   `› \`/game setadminaccess [key|all]\` — scope the admin to one game\n`
                 : ``) +
@@ -219,11 +133,9 @@ function buildHelpText(settings, forCreator = false, section = null) {
 
 // ─── Main handler ─────────────────────────────────────────────
 async function handleAdminCommand(ctx) {
-    cleanExpiredKeys()
-
     const {
         sock, settings, words, games, activeGameChatRef,
-        pendingAdminChangeRef, saveSettings, saveWords, persistGames,
+        saveSettings, saveWords, persistGames,
         sendSafeMessage, getGameState, startTurnCountdown,
         fs, nameCache,
         senderNumber, senderJid, senderName, body, senderTier,
@@ -244,12 +156,9 @@ async function handleAdminCommand(ctx) {
     const parts = raw.split(' ')
     const cmd   = parts.slice(1)
 
-    if (senderIsCreator || isAdmin) {
-        adminLastActive = Date.now()
-        if (settings.adminNumber && !adminInactivityTimer) {
-            startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
-        }
-    }
+    // Admin-inactivity tracking now lives entirely in admin-onboarding.js
+    // (started at boot via ensureInactivityTimerRunning, and restarted on
+    // every successful /admin key redemption) — nothing to do here.
 
     // Note: switching games / scoping admin access is NOT handled here.
     // It lives entirely under the fixed "/game" prefix in index.js, so
@@ -257,321 +166,24 @@ async function handleAdminCommand(ctx) {
     // game-switch-commands.js.
 
     // ══════════════════════════════════════════════
-    //  /hmg admin
+    //  /admin — redirect only
+    //  Admin identity onboarding (key request → creator approves →
+    //  key sent) now lives in the shared, game-agnostic /admin-onboarding.js
+    //  module under the fixed "/admin ..." prefix (see index.js) — the
+    //  exact same reasoning as why "/game ..." is fixed and game-agnostic.
+    //  It used to live here, only reachable while Hangman was the active
+    //  game, which silently broke onboarding on any other active game.
     // ══════════════════════════════════════════════
-    if (cmd[0] === 'admin') {
-
-        if (senderIsCreator) {
-            await sendSafeMessage(sock, senderJid, {
-                text:
-                    `${config.DIVIDER}\n` +
-                    `   🔐  Sky Graphics Creator\n` +
-                    `${config.DIVIDER}\n\n` +
-                    `Welcome back, *Founder*. 👋\n\n` +
-                    `You have *unrestricted access* to every function of this bot — ` +
-                    `no keys, no approvals, no gates.\n\n` +
-                    `Type */hmg help* to open the full dashboard.\n\n` +
-                    `${config.DIVIDER}\n` +
-                    `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
-            })
-            return
-        }
-
-        if (isAdmin && settings.adminNumber !== '') {
-            await sendSafeMessage(sock, senderJid, {
-                text:
-                    `${config.DIVIDER}\n` +
-                    `   👑  ${config.GAME_ACRONYM} Administrator\n` +
-                    `${config.DIVIDER}\n\n` +
-                    `Welcome back, *Administrator*. 👋\n\n` +
-                    `You have full control of the *${config.GAME_ACRONYM} Bot* for your community.\n\n` +
-                    `Type */hmg help* to open your full dashboard.\n\n` +
-                    `${config.DIVIDER}\n` +
-                    `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
-            })
-            return
-        }
-
-        if (settings.adminNumber !== '' && !isAdmin) {
-            if (checkAdminRateLimit(senderNumber)) return
-            await sendSafeMessage(sock, requesterJid, {
-                text: `ℹ️ This bot is already configured. Contact the group admin for assistance.`
-            })
-            return
-        }
-
-        const voided = voidedSessions[senderNumber]
-        if (voided && Date.now() - voided.voidedAt < VOIDED_LOCKOUT_MS) {
-            if (checkAdminRateLimit(senderNumber)) return
-            await sendSafeMessage(sock, requesterJid, {
-                text:
-                    `🚫 *Session Voided*\n\n` +
-                    `Too many incorrect attempts. Your access session has been cancelled.\n\n` +
-                    `Contact the *Sky Graphics* team to request a new key. 📩`
-            })
-            return
-        }
-
-        const input = cmd.slice(1).join(' ').trim()
-
-        if (input) {
-            if (checkAdminRateLimit(senderNumber)) return
-
-            const session = pendingKeys[senderJid]
-
-            if (!session) {
-                await sendSafeMessage(sock, requesterJid, {
-                    text:
-                        `🔒 *Access Denied*\n\n` +
-                        `No active configuration session was found for your account.\n\n` +
-                        `If you believe this is an error, contact the *Sky Graphics* team. 📩`
-                })
-                return
-            }
-
-            if (Date.now() > session.expiresAt) {
-                delete pendingKeys[senderJid]
-                delete approvalQueue[senderNumber]
-                await sendSafeMessage(sock, requesterJid, {
-                    text:
-                        `⏰ *Session Expired*\n\n` +
-                        `Your configuration window has closed.\n\n` +
-                        `Contact the *Sky Graphics* team to request access again. 📩`
-                })
-                return
-            }
-
-            if (input.toLowerCase() !== session.key.toLowerCase()) {
-                session.attempts = (session.attempts || 0) + 1
-                console.warn(`[SECURITY] Wrong key attempt ${session.attempts}/3 from ${senderNumber} (JID: ${senderJid})`)
-
-                if (session.attempts >= 3) {
-                    delete pendingKeys[senderJid]
-                    delete approvalQueue[senderNumber]
-                    voidedSessions[senderNumber] = { voidedAt: Date.now() }
-                    await sendSafeMessage(sock, requesterJid, {
-                        text:
-                            `🚫 *Session Voided*\n\n` +
-                            `Too many incorrect attempts. Your access session has been cancelled.\n\n` +
-                            `Contact the *Sky Graphics* team to request a new key. 📩`
-                    })
-                    if (creatorJid) {
-                        try {
-                            await sendSafeMessage(sock, creatorJid, {
-                                text:
-                                    `⚠️ *Key Session Voided*\n\n` +
-                                    `\`${senderNumber}\` made 3 incorrect key attempts — their session has been cancelled automatically. 🔒`
-                            })
-                        } catch (_) {}
-                    }
-                } else {
-                    await sendSafeMessage(sock, requesterJid, {
-                        text:
-                            `❌ *Invalid Key*\n\n` +
-                            `The key you entered is incorrect. (Attempt ${session.attempts}/3)\n\n` +
-                            `Double-check the key and try again: \`/hmg admin YOURKEY\` 🔑`
-                    })
-                }
-                return
-            }
-
-            const approvedSession = { ...session }
-            delete pendingKeys[senderJid]
-            delete approvalQueue[senderNumber]
-
-            const confirmedPN  = requesterJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
-            const confirmedJid = requesterJid
-
-            settings.adminNumber = confirmedPN || senderNumber
-            settings.adminJid    = confirmedJid || senderJid
-            saveSettings()
-
-            console.log(`👑 Admin registered — PN: ${settings.adminNumber} | JID: ${settings.adminJid}`)
-
-            startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
-
-            await sendSafeMessage(sock, confirmedJid, {
-                text:
-                    `${config.DIVIDER}\n` +
-                    `   👑  Access Granted\n` +
-                    `${config.DIVIDER}\n\n` +
-                    `Welcome, *Administrator!* 🎉\n\n` +
-                    `You now have full control of the *${config.GAME_ACRONYM} Bot* for your community.\n\n` +
-                    `Type */hmg help* to open your full dashboard.\n\n` +
-                    `${config.DIVIDER}\n` +
-                    `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
-            })
-
-            if (creatorJid) {
-                try {
-                    await sendSafeMessage(sock, creatorJid, {
-                        text:
-                            `✅ *Admin Registration Complete*\n\n` +
-                            `👤 Name: *${approvedSession.senderName || 'Unknown'}*\n` +
-                            `📱 Number: \`${settings.adminNumber}\`\n\n` +
-                            `_Bot is now live under new admin._ 🚀`
-                    })
-                } catch (_) {}
-            }
-            return
-        }
-
-        if (checkAdminRateLimit(senderNumber)) return
-
-        const newKey  = generateKey()
-        const reqName = senderName || senderNumber
-
-        pendingKeys[senderJid] = {
-            key: newKey,
-            expiresAt: Date.now() + 10 * 60 * 1000,
-            senderNumber,
-            senderName: reqName
-        }
-        approvalQueue[senderNumber] = senderJid
-
-        await sendSafeMessage(sock, requesterJid, {
+    if (cmd[0] === 'admin' || cmd[0] === 'approve' || cmd[0] === 'deny') {
+        await sendSafeMessage(sock, senderJid, {
             text:
-                `${config.DIVIDER}\n` +
-                `   🔐  Admin Configuration\n` +
-                `${config.DIVIDER}\n` +
-                `_${config.GAME_ACRONYM} Bot · by Sky Graphics_ 🎨\n\n` +
-                `Hello! 👋\n\n` +
-                `You're attempting to access the *Bot Administration Panel*.\n\n` +
-                `To proceed, enter the access key provided to you by the *Sky Graphics team*:\n\n` +
-                `\`/hmg admin YOURKEY\`\n\n` +
-                `${config.DIVIDER}\n` +
-                `📩 Don't have a key? Contact Sky Graphics to request access.`
-        })
-
-        if (creatorJid) {
-            try {
-                await sendSafeMessage(sock, creatorJid, {
-                    text:
-                        `${config.DIVIDER}\n` +
-                        `   🔔  Admin Access Request\n` +
-                        `${config.DIVIDER}\n\n` +
-                        `Someone is requesting admin access to your bot.\n\n` +
-                        `👤 *Name:* ${reqName}\n` +
-                        `📱 *Number:* \`${senderNumber}\`\n` +
-                        `🗝️ *Key:* \`${newKey}\`\n\n` +
-                        `*What do you want to do?*\n\n` +
-                        `✅ To *approve* and send them the key:\n` +
-                        `\`/hmg approve ${senderNumber}\`\n\n` +
-                        `❌ To *deny* and void the key immediately:\n` +
-                        `\`/hmg deny ${senderNumber}\`\n\n` +
-                        `_If you do nothing, the key auto-expires in 10 minutes._\n\n` +
-                        `${config.DIVIDER}\n` +
-                        `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
-                })
-            } catch (err) {
-                console.log('⚠️ Could not DM creator with key request:', err.message)
-                console.log(`[FALLBACK] Admin key for ${senderNumber}: ${newKey}`)
-            }
-        } else {
-            console.log(`[NO CREATOR_JID SET] Admin key for ${senderNumber}: ${newKey}`)
-        }
-        return
-    }
-
-    // ══════════════════════════════════════════════
-    //  /hmg approve [number] — CREATOR ONLY
-    // ══════════════════════════════════════════════
-    if (cmd[0] === 'approve') {
-        if (!senderIsCreator) return
-
-        const targetNumber = (cmd[1] || '').replace(/[^0-9]/g, '')
-        if (!targetNumber) {
-            await sendSafeMessage(sock, creatorJid, { text: `⚠️ Usage: \`/hmg approve [number]\`` })
-            return
-        }
-
-        const targetJid = approvalQueue[targetNumber]
-        if (!targetJid || !pendingKeys[targetJid]) {
-            await sendSafeMessage(sock, creatorJid, {
-                text: `⚠️ *No active request found for* \`${targetNumber}\`\n\nThe session may have already expired or been denied.`
-            })
-            return
-        }
-
-        const session = pendingKeys[targetJid]
-
-        if (Date.now() > session.expiresAt) {
-            delete pendingKeys[targetJid]
-            delete approvalQueue[targetNumber]
-            await sendSafeMessage(sock, creatorJid, {
-                text: `⏰ *Too late* — the session for \`${targetNumber}\` already expired.`
-            })
-            return
-        }
-
-        try {
-            await sendSafeMessage(sock, targetJid, {
-                text:
-                    `${config.DIVIDER}\n` +
-                    `   🗝️  Your Access Key\n` +
-                    `${config.DIVIDER}\n` +
-                    `_From the Sky Graphics Team_ 🎨\n\n` +
-                    `Your request has been *approved*. ✅\n\n` +
-                    `Here is your access key:\n\n` +
-                    `*\`${session.key}\`*\n\n` +
-                    `To activate your admin account, type:\n` +
-                    `\`/hmg admin ${session.key}\`\n\n` +
-                    `⏰ *This key expires in 10 minutes.*\n` +
-                    `Do not share it with anyone.\n\n` +
-                    `${config.DIVIDER}\n` +
-                    `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
-            })
-
-            await sendSafeMessage(sock, creatorJid, {
-                text: `✅ *Key delivered to* \`${targetNumber}\`\n\nThey now have until the 10-minute window closes to activate. ⏱️`
-            })
-        } catch (err) {
-            await sendSafeMessage(sock, creatorJid, {
-                text: `⚠️ *Could not deliver key to* \`${targetNumber}\`: ${err.message}`
-            })
-        }
-        return
-    }
-
-    // ══════════════════════════════════════════════
-    //  /hmg deny [number] — CREATOR ONLY
-    // ══════════════════════════════════════════════
-    if (cmd[0] === 'deny') {
-        if (!senderIsCreator) return
-
-        const targetNumber = (cmd[1] || '').replace(/[^0-9]/g, '')
-        if (!targetNumber) {
-            await sendSafeMessage(sock, creatorJid, { text: `⚠️ Usage: \`/hmg deny [number]\`` })
-            return
-        }
-
-        const targetJid = approvalQueue[targetNumber]
-        if (!targetJid || !pendingKeys[targetJid]) {
-            await sendSafeMessage(sock, creatorJid, {
-                text: `⚠️ *No active request found for* \`${targetNumber}\`\n\nAlready expired, approved, or never requested.`
-            })
-            return
-        }
-
-        delete pendingKeys[targetJid]
-        delete approvalQueue[targetNumber]
-
-        try {
-            await sendSafeMessage(sock, targetJid, {
-                text:
-                    `${config.DIVIDER}\n` +
-                    `_Sky Graphics · ${config.GAME_ACRONYM} Bot_ 🎨\n` +
-                    `${config.DIVIDER}\n\n` +
-                    `Your access request could not be processed at this time.\n\n` +
-                    `For further assistance, contact the *Sky Graphics* team directly. 📩`
-            })
-        } catch (_) {}
-
-        await sendSafeMessage(sock, creatorJid, {
-            text: `🚫 *Request denied and key voided.*\n\n\`${targetNumber}\` has been notified without details. 🔒`
+                `ℹ️ Admin onboarding moved to a fixed, game-independent command.\n\n` +
+                `Use *\`/admin\`* instead of *\`/admin\`* — it works the same way, ` +
+                `no matter which game is currently active.`
         })
         return
     }
+
 
     // ══════════════════════════════════════════════
     //  /hmg help — admin + creator only, DM only
@@ -605,65 +217,19 @@ async function handleAdminCommand(ctx) {
 
     const replyTo = senderJid
 
-    // ─── /hmg set admin ──────────────────────────
-    if (cmd[0] === 'set' && cmd[1] === 'admin') {
-        const newAdmin = (cmd[2] || '').replace(/[^0-9]/g, '')
-        if (newAdmin) {
-            pendingAdminChangeRef.value = { number: newAdmin }
-            await sendSafeMessage(sock, replyTo, {
-                text:
-                    `⚠️ *Confirm Admin Change?*\n\n` +
-                    `New number: *${newAdmin}*\n\n` +
-                    `Type */hmg confirm* to apply, or */hmg cancel* to discard.`
-            })
-        } else {
-            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/hmg set admin [full number with country code]\`` })
-        }
-        return
-    }
-
-    if (cmd[0] === 'confirm') {
-        if (pendingAdminChangeRef.value) {
-            const confirmed = pendingAdminChangeRef.value
-            pendingAdminChangeRef.value = null
-            settings.adminNumber = confirmed.number
-            settings.adminJid    = ''
-            saveSettings()
-            startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
-            await sendSafeMessage(sock, replyTo, {
-                text: `✅ *Admin updated to* \`${settings.adminNumber}\`\n\nNew admin must send any message to the bot so their JID is captured. 📡`
-            })
-            try {
-                // BUG FIX: this used to send to the bare phone number
-                // (e.g. "237682477421") instead of a real WhatsApp JID, so
-                // the welcome DM silently never delivered.
-                await sendSafeMessage(sock, `${settings.adminNumber}@s.whatsapp.net`, {
-                    text:
-                        `${config.DIVIDER}\n` +
-                        `   👑  You're the Admin\n` +
-                        `${config.DIVIDER}\n\n` +
-                        `Welcome! 🎉 You have been assigned as the *${config.GAME_ACRONYM} Bot* administrator.\n\n` +
-                        `Type */hmg help* to see all your commands.\n\n` +
-                        `${config.DIVIDER}\n` +
-                        `_${config.GAME_ACRONYM} Bot · Sky Graphics_ 🎨`
-                })
-            } catch (err) {
-                console.log('⚠️ Could not DM new admin:', err.message)
-            }
-        } else {
-            await sendSafeMessage(sock, replyTo, { text: `⚠️ Nothing to confirm. Use \`/hmg set admin [number]\` first.` })
-        }
-        return
-    }
-
-    if (cmd[0] === 'cancel') {
-        if (pendingAdminChangeRef.value) {
-            const cancelled = pendingAdminChangeRef.value.number
-            pendingAdminChangeRef.value = null
-            await sendSafeMessage(sock, replyTo, { text: `❌ Admin change to \`${cancelled}\` cancelled.` })
-        } else {
-            await sendSafeMessage(sock, replyTo, { text: `⚠️ Nothing to cancel.` })
-        }
+    // ─── /hmg set admin / confirm / cancel — redirect only ──
+    // Manual admin override (bypassing the key-exchange dance) now
+    // lives at the universal "/admin set [number] [gamekey|all]" +
+    // "/admin confirm" / "/admin cancel" — see admin-onboarding.js.
+    // It used to be reachable only via "/hmg", which meant "who's
+    // admin, and for which game(s)" was set from inside one specific
+    // game's command file instead of the bot-identity layer.
+    if ((cmd[0] === 'set' && cmd[1] === 'admin') || cmd[0] === 'confirm' || cmd[0] === 'cancel') {
+        await sendSafeMessage(sock, replyTo, {
+            text:
+                `ℹ️ Manual admin assignment moved to a fixed, game-independent command.\n\n` +
+                `Use *\`/admin set [number] [gamekey|all]\`* → *\`/admin confirm\`* instead of *\`/hmg set admin\`* / *\`/hmg confirm\`*.`
+        })
         return
     }
 
@@ -820,26 +386,22 @@ async function handleAdminCommand(ctx) {
     }
 
     // ─── /hmg clearadmin ─────────────────────────
+    // NOTE: this now only resets HANGMAN'S OWN admin-layer settings
+    // (max tries, public access, etc). Clearing the admin IDENTITY
+    // itself (settings.adminNumber/adminJid) moved to the universal
+    // "/admin clear" — same reasoning as "/admin set": who the admin
+    // is isn't Hangman's to decide, so it shouldn't be Hangman's to
+    // un-decide either.
     if (cmd[0] === 'clearadmin') {
-        const cleared = settings.adminNumber
-        settings.adminNumber    = ''
-        settings.adminJid       = ''
         settings.maxTries       = 'auto'
         settings.publicVisible  = true
         settings.publicCanStart = false
         settings.autoJoin       = true
-        pendingAdminChangeRef.value = null
         saveSettings()
-        if (adminInactivityTimer) {
-            clearInterval(adminInactivityTimer)
-            adminInactivityTimer = null
-        }
         await sendSafeMessage(sock, replyTo, {
             text:
-                `✅ *Admin slot cleared.*\n\n` +
-                `${cleared || 'No admin'} has been removed and the admin-layer settings (max tries, public access) were reset to defaults.\n\n` +
-                `Word pool and any creator overrides are untouched.\n\n` +
-                `The next */hmg admin* request will begin a fresh onboarding. 🔑`
+                `✅ *Hangman's admin-layer settings reset to defaults* (max tries, public access, auto-join).\n\n` +
+                `This did *not* remove the admin identity — use */admin clear* for that.`
         })
         return
     }
@@ -856,7 +418,6 @@ async function handleAdminCommand(ctx) {
         settings.adminNumber = keepAdminNumber
         settings.adminJid    = keepAdminJid
         saveSettings()
-        pendingAdminChangeRef.value = null
 
         const { DEFAULT_WORDS } = require('./gameEngine')
         words.length = 0
@@ -882,7 +443,7 @@ async function handleAdminCommand(ctx) {
                 `Settings, creator overrides, and the word pool were restored to defaults. Any active game was ended.\n\n` +
                 (keepAdminNumber
                     ? `👑 Admin (\`${keepAdminNumber}\`) keeps their access — use */hmg clearadmin* if you want to remove them too.`
-                    : `The bot has no admin set — the next */hmg admin* request will begin onboarding.`)
+                    : `The bot has no admin set — the next */admin* request will begin onboarding.`)
         })
         return
     }

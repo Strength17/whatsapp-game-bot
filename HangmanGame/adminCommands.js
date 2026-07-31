@@ -187,8 +187,11 @@ async function handleAdminCommand(ctx) {
 
     // ══════════════════════════════════════════════
     //  /hmg help — admin + creator only, DM only
+    //  Bare "/hmg" (no subcommand) is an alias for "/hmg help" — same
+    //  reasoning as bare "/admin" and bare "/game" being valid entry
+    //  points rather than dead ends.
     // ══════════════════════════════════════════════
-    if (cmd[0] === 'help') {
+    if (cmd[0] === 'help' || cmd[0] === undefined || cmd[0] === '') {
         const rawSection = cmd[1]
         const section = rawSection === undefined ? null : parseInt(rawSection, 10)
         if (senderIsCreator) {

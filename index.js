@@ -561,9 +561,17 @@ async function startBot() {
             }
             const adminPrefix = activeGame.config.ADMIN_PREFIX
             const prefix       = activeGame.config.PREFIX
+            // ADMIN_PREFIX is stored with a trailing space (e.g. '/hmg ') so
+            // "/hmg help" matches via startsWith. That space only exists once
+            // a subcommand follows it — bare "/hmg" has no space and was
+            // matching neither this nor PREFIX, so it silently went nowhere.
+            // Matches the bare-or-subcommand pattern already used for
+            // "/admin" and "/game" above.
+            const adminPrefixBare = adminPrefix.trim()
+            const matchesAdminPrefix = body === adminPrefixBare || body.startsWith(adminPrefix)
 
             const effectivePublicVisible = resolveSetting('publicVisible', settings, true)
-            if (!isAdmin && !effectivePublicVisible && !body.startsWith(adminPrefix)) continue
+            if (!isAdmin && !effectivePublicVisible && !matchesAdminPrefix) continue
 
             if (senderNumber === settings.adminNumber) {
                 if (msg.pushName) rememberName(settings.adminNumber, msg.pushName)
@@ -575,7 +583,7 @@ async function startBot() {
             }
 
             // ── "/" admin commands → active game's handler ──
-            if (body.startsWith(adminPrefix)) {
+            if (matchesAdminPrefix) {
                 const cmdCtx = {
                     ...buildCtx(sock),
                     saveSettings,

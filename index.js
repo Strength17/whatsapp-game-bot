@@ -298,7 +298,7 @@ async function startBot() {
 
         if (connection === 'open') {
             const activeGame = registry.getActiveGame(settings)
-            console.log(`✅ HMG Bot is connected! Active game: ${activeGame ? activeGame.config.GAME_NAME : 'NONE LOADED'} 🎮`)
+            console.log(`✅ Bot is connected! Active game: ${activeGame ? activeGame.config.GAME_NAME : 'NONE LOADED'} 🎮`)
 
             // Resume the 30-day admin-inactivity clock on restart, if an
             // admin is already configured — this used to only happen as

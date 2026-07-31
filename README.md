@@ -2,8 +2,8 @@
 
 A WhatsApp game bot (built on Baileys) with a pluggable structure — the
 creator can add and switch between games without touching the core bot.
-Currently runs **two games**: **Hangman** (`hangman`) and **Word Climb**
-(`wordclimb`).
+Currently runs **three games**: **Hangman** (`hangman`), **Word Climb**
+(`wordclimb`), and **Roast Game** (`roast`).
 
 **→ Building a new game? Read [`ARCHITECTURE.md`](./ARCHITECTURE.md)
 first.** That's the canonical plugin contract — this file is the tour.
@@ -16,12 +16,18 @@ This README won't repeat what's there.
 It catches missing dependencies, unwired game folders, broken contracts,
 and state-isolation bugs before any host sees them.
 
+**→ Only one game is active at a time, bot-wide.** Switching with
+`/game setgame [key]` makes every other game's public prefix stop
+responding until you switch back — this isn't a bug, see
+`ARCHITECTURE.md` if you're unsure why.
+
 This project is written so it can be handed to **another AI** (or another
 developer) to build a new game with **zero changes to any existing game
 folder** — only the shared root files (`index.js`, `admin-onboarding.js`,
 `game-switch-commands.js`, `games-registry.js`) are meant to be touched
 across the whole project's lifetime, and even those only for genuinely
-game-agnostic concerns.
+game-agnostic concerns. `index.js` in particular should never reference
+a specific game's name/acronym directly — only `activeGame.config.*`.
 
 ---
 
@@ -50,6 +56,7 @@ game-agnostic concerns.
 
 /HangmanGame/       ← !hmg / /hmg
 /WordClimbGame/     ← !wcl / /wcl
+/RoastGame/         ← !roast / /roast
 
 /<AnyNewGame>/              ← next game goes here; see ARCHITECTURE.md
     config.js
@@ -60,9 +67,12 @@ game-agnostic concerns.
     README.md               ← that game's own rules + commands
 ```
 
-**Runtime files** (created automatically, not shipped in this zip):
-`settings.json`, `words.json`, `games.json`, `names.json`, `lidcache.json`,
-`auth_info/`.
+**Runtime files** (created automatically, never committed — see
+`.gitignore`): `settings.json`, `words.json`, `games.json`, `names.json`,
+`lidcache.json`, `auth_info/`.
+
+**Not created automatically — you must make this yourself:** `.env`.
+See §7 below; the bot cannot identify its own creator without it.
 
 ---
 
@@ -116,7 +126,7 @@ any individual game's folder:
   outgoing game supports it); `/game setadminaccess [gamekey|all]`
   scopes the admin; `/game status` shows both at a glance.
 
-Full command tables for both: [`COMMAND_REFERENCE.md`](./COMMAND_REFERENCE.md) §1.
+Full command tables for all three games: [`COMMAND_REFERENCE.md`](./COMMAND_REFERENCE.md) §1.
 
 ---
 
@@ -126,6 +136,7 @@ Full command tables for both: [`COMMAND_REFERENCE.md`](./COMMAND_REFERENCE.md) �
 |---|---|---|---|
 | Hangman | `hangman` | `!hmg` | `/hmg ` |
 | Word Climb | `wordclimb` | `!wcl` | `/wcl ` |
+| Roast Game | `roast` | `!roast` | `/roast ` |
 
 ### Hangman (HMG)
 Classic single-word elimination, adapted for a live group chat.
@@ -143,6 +154,13 @@ Turn-based elimination — the required word length escalates a rung at
 a time (3→8 letters), 3 strikes and you're out.
 - Full rules + command list: [`WordClimbGame/README.md`](./WordClimbGame/README.md).
 
+### Roast Game (RST)
+Private, DM-delivered roasts, hand-curated once from real group chat
+history — no live AI call, no rebuild command, no lobby or round.
+- Content lives in `RoastGame/roastData.js` and is edited offline.
+- Full rules, command list, and exclusion policy:
+  [`RoastGame/README.md`](./RoastGame/README.md).
+
 ---
 
 ## 6. Adding a new game
@@ -151,7 +169,51 @@ a time (3→8 letters), 3 strikes and you're out.
 2. Create `<NewGame>/` with the required files (see §1 above).
 3. Give it its own `GAME_KEY` / `PREFIX` / `ADMIN_PREFIX` in `config.js`
    — no other file needs to know it exists.
-4. Write `<NewGame>/README.md` following the same shape as
-   `HangmanGame/README.md` or `WordClimbGame/README.md`.
+4. Write `<NewGame>/README.md` following the same shape as the other
+   games' READMEs.
 5. Run `npm run verify` before deploying. It checks the contract, state
    isolation, and the bare-acronym rule automatically.
+
+---
+
+## 7. Running it locally
+
+```
+npm install
+```
+
+**Before your first run**, create a `.env` file in the project root
+(next to `index.js` — this file is never shipped, never committed, and
+must be created by hand on every machine you run the bot on):
+
+```
+CREATOR_JID=23768XXXXXXX@s.whatsapp.net
+```
+
+Use your real WhatsApp number, digits only, in the full JID format
+(`number@s.whatsapp.net`) — not a bare number, no `+`/spaces/dashes.
+Without this file, the bot will still connect and pair via QR code, but
+it will never recognize you as CREATOR — no boot DM, no `/game`
+commands, no admin approvals will work, because `permissions.js` has
+nothing to compare the sender against.
+
+Then:
+
+```
+node index.js
+```
+
+Scan the printed QR code with WhatsApp on first run. `auth_info/` then
+holds the session — delete it to force a fresh QR-code login.
+
+---
+
+## 8. Hosting
+
+Previously hosted on Railway. Baileys needs an **always-on process with
+persistent disk** (for `auth_info/`, `settings.json`, etc.) — serverless
+platforms and free tiers that sleep on inactivity aren't a fit. Current
+options in use or under consideration: running locally, or a small
+always-on VPS (Oracle Cloud's Always Free tier, or a low-cost DigitalOcean
+droplet). On any host other than local, set `CREATOR_JID` through that
+host's environment-variable UI instead of a `.env` file.

@@ -178,7 +178,7 @@ async function handleAdminCommand(ctx) {
         await sendSafeMessage(sock, senderJid, {
             text:
                 `ℹ️ Admin onboarding moved to a fixed, game-independent command.\n\n` +
-                `Use *\`/admin\`* instead of *\`/admin\`* — it works the same way, ` +
+                `Use *\`/admin\`* instead of *\`${config.ADMIN_PREFIX.trim()} ${cmd[0]}\`* — it works the same way, ` +
                 `no matter which game is currently active.`
         })
         return
